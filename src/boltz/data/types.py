@@ -506,6 +506,7 @@ class ChainInfo:
     num_residues: int
     valid: bool = True
     entity_id: Optional[Union[str, int]] = None
+    template_ids: Optional[list[Union[str, int]]] = None
 
 
 @dataclass(frozen=True)
@@ -691,6 +692,30 @@ class Manifest(JSONSerializable):
 
 
 ####################################################################################################
+# TEMPLATE
+####################################################################################################
+
+TemplateCoordinates = [
+    ("res_idx", np.dtype("i4")),
+    ("res_type", np.dtype("i1")),
+    ("frame_rot", np.dtype("9f4")),
+    ("frame_t", np.dtype("3f4")),
+    ("coords_cb", np.dtype("3f4")),
+    ("coords_ca", np.dtype("3f4")),
+    ("mask_frame", np.dtype("?")),
+    ("mask_cb", np.dtype("?")),
+    ("mask_ca", np.dtype("?")),
+]
+
+
+@dataclass(frozen=True, slots=True)
+class Template(NumpySerializable):
+    """Template datatype."""
+
+    coordinates: np.ndarray
+
+
+####################################################################################################
 # INPUT
 ####################################################################################################
 
@@ -782,3 +807,24 @@ class Tokenized:
     template_tokens: Optional[dict[str, np.ndarray]] = None
     template_bonds: Optional[dict[str, np.ndarray]] = None
     extra_mols: Optional[dict[str, Mol]] = None
+
+
+@dataclass(frozen=True)
+class TokenizedTraining:
+    """Tokenized datatype."""
+
+    tokens: np.ndarray
+    bonds: np.ndarray
+    structure: Structure
+
+
+@dataclass(frozen=True, slots=True)
+class InputTraining:
+    """Input datatype."""
+
+    tokens: np.ndarray
+    bonds: np.ndarray
+    structure: Structure
+    msa: dict[str, MSA]
+    templates: dict[str, list[Template]]
+    record: Optional[Record] = None

@@ -1,10 +1,10 @@
 import math
-from typing import Optional
 from collections import deque
+from typing import Optional
+
 import numba
 import numpy as np
 import numpy.typing as npt
-import rdkit.Chem.Descriptors
 import torch
 from numba import types
 from rdkit.Chem import Mol
@@ -421,8 +421,9 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     # Map (chain_id, seq_idx, res_idx) to deletion
     deletions = numba.typed.Dict.empty(
         key_type=numba.types.Tuple(
-            [numba.types.int64, numba.types.int64, numba.types.int64]),
-        value_type=numba.types.int64
+            [numba.types.int64, numba.types.int64, numba.types.int64]
+        ),
+        value_type=numba.types.int64,
     )
     for chain_id, chain_msa in msa.items():
         chain_deletions = chain_msa.deletions
@@ -2201,6 +2202,8 @@ class Boltz2Featurizer:
             list[tuple[tuple[int, int], tuple[int, int], float]]
         ] = None,
         compute_affinity: bool = False,
+        use_templates: bool = False,
+        training: bool = False,
     ) -> dict[str, Tensor]:
         """Compute features.
 
@@ -2309,16 +2312,19 @@ class Boltz2Featurizer:
 
         # Compute template features
         num_tokens = data.tokens.shape[0] if max_tokens is None else max_tokens
-        if data.templates and not compute_affinity:
-            template_features = process_template_features(
-                data=data,
-                max_tokens=num_tokens,
-            )
+        if training:
+            template_features = {}
         else:
-            template_features = load_dummy_templates_features(
-                tdim=1,
-                num_tokens=num_tokens,
-            )
+            if data.templates and not compute_affinity:
+                template_features = process_template_features(
+                    data=data,
+                    max_tokens=num_tokens,
+                )
+            else:
+                template_features = load_dummy_templates_features(
+                    tdim=1,
+                    num_tokens=num_tokens,
+                )
 
         # Compute symmetry features
         symmetry_features = {}
@@ -2335,8 +2341,12 @@ class Boltz2Featurizer:
             chain_constraint_features = process_chain_feature_constraints(data)
             contact_constraint_features = process_contact_feature_constraints(
                 data=data,
-                inference_pocket_constraints=inference_pocket_constraints if inference_pocket_constraints else [],
-                inference_contact_constraints=inference_contact_constraints if inference_contact_constraints else [],
+                inference_pocket_constraints=inference_pocket_constraints
+                if inference_pocket_constraints
+                else [],
+                inference_contact_constraints=inference_contact_constraints
+                if inference_contact_constraints
+                else [],
             )
 
         return {

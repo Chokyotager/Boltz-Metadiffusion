@@ -133,6 +133,7 @@ class Boltz2(LightningModule):
         self.diffusion_loss_args = diffusion_loss_args
         self.predict_args = predict_args
         self.steering_args = steering_args
+        self.validate_structure = validate_structure
 
         # Training metrics
         if validate_structure:

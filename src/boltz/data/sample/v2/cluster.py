@@ -1,10 +1,7 @@
-from collections.abc import Iterator
-
 import numpy as np
-from numpy.random import RandomState
 
 from boltz.data import const
-from boltz.data.sample.sampler import Sample, Sampler
+from boltz.data.sample.v2.sampler import Sample, Sampler
 from boltz.data.types import ChainInfo, InterfaceInfo, Record
 
 
@@ -201,24 +198,18 @@ class ClusterSampler(Sampler):
         self.beta_chain = beta_chain
         self.beta_interface = beta_interface
 
-    def sample(  # noqa: C901, PLR0912
-        self,
-        records: list[Record],
-        random: RandomState,
-    ) -> Iterator[Sample]:
+    def sample(self, records: list[Record]) -> list[Sample]:
         """Sample a structure from the dataset infinitely.
 
         Parameters
         ----------
         records : List[Record]
             The records to sample from.
-        random : RandomState
-            The random state for reproducibility.
 
-        Yields
-        ------
-        Sample
-            A data sample.
+        Returns
+        -------
+        List[Sample]
+            The samples.
 
         """
         # Compute chain cluster sizes
@@ -244,7 +235,9 @@ class ClusterSampler(Sampler):
                 interface_clusters[cluster_id] += 1
 
         # Compute weights
-        items, weights = [], []
+        chain_samples, chain_weights = [], []
+        int_samples, int_weights = [], []
+
         for record in records:
             for chain_id, chain in enumerate(record.chains):
                 if not chain.valid:
@@ -258,8 +251,8 @@ class ClusterSampler(Sampler):
                     self.alpha_nucl,
                     self.alpha_ligand,
                 )
-                items.append((record, 0, chain_id))
-                weights.append(weight)
+                chain_samples.append((record.id, chain_id))
+                chain_weights.append(weight)
 
             for int_id, interface in enumerate(record.interfaces):
                 if not interface.valid:
@@ -273,15 +266,23 @@ class ClusterSampler(Sampler):
                     self.alpha_nucl,
                     self.alpha_ligand,
                 )
-                items.append((record, 1, int_id))
-                weights.append(weight)
+                int_samples.append((record.id, int_id))
+                int_weights.append(weight)
 
-        # Sample infinitely
-        weights = np.array(weights) / np.sum(weights)
-        while True:
-            item_idx = random.choice(len(items), p=weights)
-            record, kind, index = items[item_idx]
-            if kind == 0:
-                yield Sample(record=record, chain_id=index)
-            else:
-                yield Sample(record=record, interface_id=index)
+        # Normalize weights
+        weights_sum = np.sum(chain_weights) + np.sum(int_weights)
+        chain_weights = np.array(chain_weights) / weights_sum
+        int_weights = np.array(int_weights) / weights_sum
+
+        # Create samples
+        chain_samples = [
+            Sample(record_id=s[0], chain_id=s[1], weight=w)
+            for s, w in zip(chain_samples, chain_weights)
+        ]
+        int_samples = [
+            Sample(record_id=s[0], interface_id=s[1], weight=w)
+            for s, w in zip(int_samples, int_weights)
+        ]
+
+        samples = chain_samples + int_samples
+        return samples

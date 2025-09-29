@@ -1,9 +1,6 @@
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Optional
-
-from numpy.random import RandomState
 
 from boltz.data.types import Record
 
@@ -22,29 +19,28 @@ class Sample:
         The interface ID.
     """
 
-    record: Record
+    record_id: str
     chain_id: Optional[int] = None
     interface_id: Optional[int] = None
+    weight: Optional[float] = None
 
 
 class Sampler(ABC):
     """Abstract base class for samplers."""
 
     @abstractmethod
-    def sample(self, records: list[Record], random: RandomState) -> Iterator[Sample]:
+    def sample(self, records: list[Record]) -> list[Sample]:
         """Sample a structure from the dataset infinitely.
 
         Parameters
         ----------
         records : List[Record]
             The records to sample from.
-        random : RandomState
-            The random state for reproducibility.
 
-        Yields
-        ------
-        Sample
-            A data sample.
+        Returns
+        -------
+        List[Sample]
+            The samples.
 
         """
         raise NotImplementedError

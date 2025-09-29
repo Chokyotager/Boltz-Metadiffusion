@@ -1,8 +1,4 @@
-from collections.abc import Iterator
-
-from numpy.random import RandomState
-
-from boltz.data.sample.sampler import Sample, Sampler
+from boltz.data.sample.v2.sampler import Sample, Sampler
 from boltz.data.types import Record
 
 
@@ -23,20 +19,18 @@ class DistillationSampler(Sampler):
         self._size = small_size
         self._prob = small_prob
 
-    def sample(self, records: list[Record], random: RandomState) -> Iterator[Sample]:
+    def sample(self, records: list[Record]) -> list[Sample]:
         """Sample a structure from the dataset infinitely.
 
         Parameters
         ----------
         records : List[Record]
             The records to sample from.
-        random : RandomState
-            The random state for reproducibility.
 
-        Yields
-        ------
-        Sample
-            A data sample.
+        Returns
+        -------
+        List[Sample]
+            The samples.
 
         """
         # Remove records with invalid chains
@@ -47,11 +41,13 @@ class DistillationSampler(Sampler):
         small = [r for r in records if r.chains[0].num_residues <= self._size]
         large = [r for r in records if r.chains[0].num_residues > self._size]
 
-        # Sample infinitely
-        while True:
-            # Sample small or large
-            samples = small if random.rand() < self._prob else large
+        # Assign uniform weights to the proteins, with prob amount of small
+        weights = [self._prob / len(small)] * len(small)
+        weights += [(1 - self._prob) / len(large)] * len(large)
 
-            # Sample item from the list
-            index = random.randint(0, len(samples))
-            yield Sample(record=samples[index])
+        # Create samples
+        samples = [
+            Sample(record_id=r.id, chain_id=0, weight=w)
+            for r, w in zip(records, weights)
+        ]
+        return samples

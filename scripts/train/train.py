@@ -19,6 +19,7 @@ from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
 
 from boltz.data.module.training import BoltzTrainingDataModule, DataConfig
+from boltz.data.module.trainingv2 import Boltz2TrainingDataModule, DataConfigV2
 
 
 @dataclass
@@ -57,6 +58,8 @@ class TrainConfig:
         Fail on mismatched checkpoint weights.
     load_confidence_from_trunk: Optional[bool]
         Load pre-trained confidence weights from trunk.
+    v2: bool
+        Use v2 model.
 
     """
 
@@ -75,6 +78,7 @@ class TrainConfig:
     debug: bool = False
     strict_loading: bool = True
     load_confidence_from_trunk: Optional[bool] = False
+    v2: bool = False
 
 
 def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
@@ -123,10 +127,14 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
             wandb = None
 
     # Create objects
-    data_config = DataConfig(**cfg.data)
-    data_module = BoltzTrainingDataModule(data_config)
-    model_module = cfg.model
+    if cfg.v2:
+        data_config = DataConfigV2(**cfg.data)
+        data_module = Boltz2TrainingDataModule(data_config)
+    else:
+        data_config = DataConfig(**cfg.data)
+        data_module = BoltzTrainingDataModule(data_config)
 
+    model_module = cfg.model
     if cfg.pretrained and not cfg.resume:
         # Load the pretrained weights into the confidence module
         if cfg.load_confidence_from_trunk:

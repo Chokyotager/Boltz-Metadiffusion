@@ -12,17 +12,12 @@ from rdkit.Chem import Mol
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from boltz.data import const
 from boltz.data.crop.cropper import Cropper
 from boltz.data.feature.featurizer import BoltzFeaturizer
 from boltz.data.filter.dynamic.filter import DynamicFilter
 from boltz.data.mol import load_canonicals, load_molecules
 from boltz.data.pad import pad_to_max
 from boltz.data.sample.v2.sampler import Sample, Sampler
-from boltz.data.template.feature import (
-    compute_template_features,
-    load_dummy_templates_v2,
-)
 from boltz.data.tokenize.tokenizer import Tokenizer
 from boltz.data.types import (
     MSA,
@@ -31,7 +26,6 @@ from boltz.data.types import (
     Record,
     StructureV2,
     Template,
-    TokenizedTraining,
 )
 
 
@@ -47,8 +41,6 @@ class DatasetConfig:
     template_dir: Optional[str] = None
     filters: Optional[list[DynamicFilter]] = None
     split: Optional[str] = None
-    has_structure_label: bool = True
-    has_affinity_label: bool = False
     symmetry_correction: bool = True
     val_group: Optional[str] = "RCSB"
     use_train_subset: Optional[float] = None
@@ -96,12 +88,9 @@ class DataConfigV2:
     binder_pocket_cutoff_val: float = 6.0
     binder_pocket_sampling_geometric_p: float = 0.0
     val_batch_size: int = 1
-    return_train_affinity: bool = False
-    return_val_affinity: bool = False
     single_sequence_prop_training: float = 0.0
     msa_sampling_training: bool = False
     use_templates: bool = False
-    use_templates_v2: bool = False
     max_templates_train: int = 4
     max_templates_val: int = 4
     no_template_prob_train: float = 1.0
@@ -125,8 +114,6 @@ class Dataset:
     tokenizer: Tokenizer
     featurizer: BoltzFeaturizer
     val_group: str
-    has_structure_label: bool = True
-    has_affinity_label: bool = False
     symmetry_correction: bool = True
     moldir: Optional[str] = None
     override_bfactor: Optional[bool] = False
@@ -278,204 +265,6 @@ def load_templates(
     return templates
 
 
-def load_templates_v2(
-    tokenized: TokenizedTraining,
-    record: Record,
-    template_dir: Path,
-    structure_dir: Path,
-    tokenizer: Tokenizer,
-    max_templates: int,
-    no_template_prob: float,
-    training: bool,
-    random: np.random.Generator,
-    max_tokens: int,
-) -> dict[str, list[Template]]:
-    """Load the given input data.
-
-    Parameters
-    ----------
-    entities : dict[int, list[int]]
-        The entities to load.
-    record : str
-        The record to load.
-    template_dir : Path
-        The path to the template directory.
-    max_templates : int
-        The maximum number of templates to load.
-    no_template_prob : float
-        The probability of not loading any templates.
-    training : bool
-        Whether the data is for training.
-    random : np.random.Generator
-        The random number generator.
-
-    Returns
-    -------
-    dict[str, list[Template]]
-        The loaded templates.
-
-    """
-    # Check if template record exists
-    template_record_path = template_dir / f"{record.id}.json"
-    if not template_record_path.exists():
-        return load_dummy_templates_v2(tdim=max_templates, num_tokens=max_tokens)
-
-    # Load template record
-    with Path(template_record_path).open() as f:
-        record = json.load(f)
-        record = {k.split("_")[1]: v for k, v in record.items()}
-
-    # Get prot moltype
-    prot_moltype = const.chain_type_ids["PROTEIN"]
-
-    # Extract entity to cropped indices and entity to chains mappings
-    entity_to_crop = {}
-    entity_to_chains = {}
-    for t in tokenized.tokens:
-        if (t["mol_type"] != prot_moltype) or (str(t["entity_id"]) not in record):
-            continue
-        entity_to_crop.setdefault(str(t["entity_id"]), set()).add(int(t["res_idx"]))
-        entity_to_chains.setdefault(str(t["entity_id"]), set()).add(int(t["asym_id"]))
-
-    # Select the number of templates to sample per query entity
-    entity_counter = {}
-    for entity in entity_to_chains:
-        if (str(entity) not in record) or (random.random() < no_template_prob):
-            entity_counter[entity] = 0
-            continue
-        entity_counter[entity] = random.integers(1, max_templates + 1)
-
-    # Select templates per entity and group them by PDB ID
-    pdb_id_to_templates = {}
-    entity_to_pdb_ids = {}
-
-    for entity in entity_counter:
-        for tmpl in record[str(entity)]:
-            # Skip templates with no overlap to the query crop
-            query_range = set(range(tmpl["query_st"], tmpl["query_en"]))
-            if not (query_range & entity_to_crop[entity]):
-                continue
-
-            # Add to the PDB ID to entities mapping
-            pdb_id = tmpl["template_pdb"]
-            entity_to_pdb_ids.setdefault(entity, set()).add(pdb_id)
-            pdb_id_to_templates.setdefault(pdb_id, []).append((entity, tmpl))
-
-    # Check if query is monomeric
-    chains = tokenized.structure.chains
-    protein_chains = chains[chains["mol_type"] == prot_moltype]
-    is_query_monomeric = (protein_chains["sym_id"] == 0).sum()
-
-    # Create "rows" of template features
-    visited_pdbs = set()
-    template_features = []
-
-    for _ in range(max_templates):
-        # Get entities to fill with a template
-        entities_to_fill = {e for e in entity_to_chains if entity_counter[e] > 0}
-        for entity in entities_to_fill:
-            entity_counter[entity] -= 1
-
-        # Fill in the row for each entity, here again group by PDB ID,
-        # so mapping is from PDB ID to entities that will be templated
-        row_pdbs = {}
-        while entities_to_fill:
-            # Sample an entity and its PDB ID
-            entity = random.choice(list(entities_to_fill))
-            entities_to_fill.remove(entity)
-
-            pdbs = entity_to_pdb_ids.get(entity, set()) - visited_pdbs
-            if not pdbs:
-                continue
-
-            pdb_id = random.choice(list(pdbs))
-            visited_pdbs.add(pdb_id)
-            row_pdbs.setdefault(pdb_id, set()).add(entity)
-
-            # Expand this PDB to other query entities it contains
-            pdb_entities = {x[0] for x in pdb_id_to_templates[pdb_id]}
-            overlapping_entities = pdb_entities & entities_to_fill
-            row_pdbs[pdb_id].update(overlapping_entities)
-            entities_to_fill -= overlapping_entities
-
-        # Prepare the template row
-        row_tokens = []
-
-        # Load, tokenize, crop and featurize structures
-        for idx, (pdb_id, entities) in enumerate(row_pdbs.items()):
-            # Load the template structure
-            structure_path = structure_dir / f"{pdb_id}.npz"
-            if not structure_path.exists():
-                continue
-            structure: StructureV2 = StructureV2.load(structure_path)
-            tmpl_tokenized = tokenizer.tokenize(structure)
-
-            # Map template entities to template chain ids
-            tmpl_entity_to_chains = {}
-            for c in structure.chains:
-                tmpl_entity_to_chains.setdefault(str(c["entity_id"]), []).append(
-                    c["asym_id"]
-                )
-
-            # Now map query chains to template chains:
-            # If symmetrical, for now only map one template chain
-            # to all the query chains and mask them from one another
-            tmpl_prot_chains = structure.chains[
-                structure.chains["mol_type"] == prot_moltype
-            ]
-            is_tmpl_monomeric = (tmpl_prot_chains["sym_id"] == 0).sum()
-            is_monomeric = is_tmpl_monomeric and is_query_monomeric
-
-            for entity, tmpl in pdb_id_to_templates[pdb_id]:
-                # Skip if entity is not in the row
-                if entity not in entities:
-                    continue
-
-                # Compute the offset
-                offset = tmpl["template_st"] - tmpl["query_st"]
-
-                # Get the relevant template and query chains
-                tmpl_entity = tmpl["template_id"].split("_")[1].split("=")[1]
-                tmpl_chains = tmpl_entity_to_chains[tmpl_entity]
-                query_chains = entity_to_chains[entity]
-
-                # TODO: try to do a clever assignment here
-                for query_chain in query_chains:
-                    # Use the first template chain for now
-                    tmpl_chain = tmpl_chains[0]
-
-                    # Get query and template tokens to map residues
-                    query_tokens = tokenized.tokens
-                    q_tokens = query_tokens[query_tokens["asym_id"] == query_chain]
-                    q_indices = dict(zip(q_tokens["res_idx"], q_tokens["token_idx"]))
-
-                    # Get the template tokens at the query residues
-                    tmpl_tokens = tmpl_tokenized.tokens
-                    toks = tmpl_tokens[tmpl_tokens["asym_id"] == tmpl_chain]
-                    toks = [t for t in toks if t["res_idx"] - offset in q_indices]
-                    for t in toks:
-                        q_idx = q_indices[t["res_idx"] - offset]
-                        row_tokens.append(
-                            {
-                                "token": t,
-                                "pdb_id": idx,
-                                "q_idx": q_idx,
-                                "is_monomeric": is_monomeric,
-                            }
-                        )
-
-        # Compute template features for each row
-        row_features = compute_template_features(tokenized, row_tokens, max_tokens)
-        template_features.append(row_features)
-
-    # Stack each feature
-    out = {}
-    for k in template_features[0]:
-        out[k] = torch.stack([f[k] for f in template_features])
-
-    return out
-
-
 def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     """Collate the data.
 
@@ -572,9 +361,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         binder_pocket_cutoff_max: Optional[float] = 20.0,
         binder_pocket_sampling_geometric_p: Optional[float] = 0.0,
         return_symmetries: Optional[bool] = False,
-        return_affinity: bool = False,
         use_templates: bool = False,
-        use_templates_v2: bool = False,
         max_templates: int = 4,
         no_template_prob: float = 0.6,
         single_sequence_prop: Optional[float] = 0.0,
@@ -625,11 +412,9 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.binder_pocket_cutoff_max = binder_pocket_cutoff_max
         self.binder_pocket_sampling_geometric_p = binder_pocket_sampling_geometric_p
         self.return_symmetries = return_symmetries
-        self.return_affinity = return_affinity
         self.single_sequence_prop = single_sequence_prop
         self.msa_sampling = msa_sampling
         self.use_templates = use_templates
-        self.use_templates_v2 = use_templates_v2
         self.max_templates = max_templates
         self.no_template_prob = no_template_prob
         self.overfit = overfit
@@ -733,45 +518,22 @@ class TrainingDataset(torch.utils.data.Dataset):
         templates = FileNotFoundError
         if self.use_templates and dataset.template_dir is not None:
             try:
-                if self.use_templates_v2:
-                    templates = None
-                    templates_features = load_templates_v2(
-                        tokenized=tokenized,
-                        record=record,
-                        structure_dir=dataset.struct_dir,
-                        template_dir=dataset.template_dir,
-                        tokenizer=dataset.tokenizer,
-                        max_templates=self.max_templates,
-                        no_template_prob=self.no_template_prob,
-                        training=True,
-                        random=random,
-                        max_tokens=self.max_tokens,
-                    )
-                else:
-                    templates = load_templates(
-                        chain_ids=chain_ids,
-                        record=record,
-                        template_dir=dataset.template_dir,
-                        max_templates=self.max_templates,
-                        no_template_prob=self.no_template_prob,
-                        training=True,
-                        random=random,
-                    )
+                templates = load_templates(
+                    chain_ids=chain_ids,
+                    record=record,
+                    template_dir=dataset.template_dir,
+                    max_templates=self.max_templates,
+                    no_template_prob=self.no_template_prob,
+                    training=True,
+                    random=random,
+                )
             except Exception as e:  # noqa: BLE001
                 print(
                     f"Template loading failed for {record.id} with error {e}. Using no templates."
                 )
                 templates = None
-                if self.use_templates_v2:
-                    templates_features = load_dummy_templates_v2(
-                        tdim=self.max_templates, num_tokens=self.max_tokens
-                    )
         else:
             templates = None
-            if self.use_templates_v2:
-                templates_features = load_dummy_templates_v2(
-                    tdim=self.max_templates, num_tokens=self.max_tokens
-                )
 
         # Load molecules
         try:
@@ -825,7 +587,6 @@ class TrainingDataset(torch.utils.data.Dataset):
                 binder_pocket_cutoff_min=self.binder_pocket_cutoff_min,
                 binder_pocket_cutoff_max=self.binder_pocket_cutoff_max,
                 binder_pocket_sampling_geometric_p=self.binder_pocket_sampling_geometric_p,
-                compute_affinity=self.return_affinity,
                 single_sequence_prop=self.single_sequence_prop,
                 msa_sampling=self.msa_sampling,
                 use_templates=self.use_templates,
@@ -833,7 +594,6 @@ class TrainingDataset(torch.utils.data.Dataset):
                 override_bfactor=dataset.override_bfactor,
                 override_method=dataset.override_method,
                 compute_frames=self.compute_frames,
-                use_templates_v2=self.use_templates_v2,
                 bfactor_md_correction=self.bfactor_md_correction,
             )
         except Exception as e:  # noqa: BLE001
@@ -842,10 +602,6 @@ class TrainingDataset(torch.utils.data.Dataset):
 
             traceback.print_exc()
             return self.__getitem__(idx)
-
-        # Compute template features
-        if self.use_templates_v2:
-            features.update(templates_features)
 
         features["pdb_id"] = record.id
         return features
@@ -890,9 +646,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         binder_pocket_conditioned_prop: Optional[float] = 0.0,
         contact_conditioned_prop: Optional[float] = 0.0,
         binder_pocket_cutoff: Optional[float] = 6.0,
-        return_affinity: bool = False,
         use_templates: bool = False,
-        use_templates_v2: bool = False,
         max_templates: int = 4,
         no_template_prob: float = 0.0,
         compute_frames: bool = False,
@@ -933,12 +687,10 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.disto_use_ensemble = disto_use_ensemble
         self.fix_single_ensemble = fix_single_ensemble
         self.return_symmetries = return_symmetries
-        self.return_affinity = return_affinity
         self.binder_pocket_conditioned_prop = binder_pocket_conditioned_prop
         self.contact_conditioned_prop = contact_conditioned_prop
         self.binder_pocket_cutoff = binder_pocket_cutoff
         self.use_templates = use_templates
-        self.use_templates_v2 = use_templates_v2
         self.max_templates = max_templates
         self.no_template_prob = no_template_prob
         self.compute_frames = compute_frames
@@ -997,46 +749,22 @@ class ValidationDataset(torch.utils.data.Dataset):
         # Load templates
         if self.use_templates and dataset.template_dir is not None:
             try:
-                if self.use_templates_v2:
-                    templates = None
-                    templates_features = load_templates_v2(
-                        tokenized=tokenized,
-                        record=record,
-                        structure_dir=dataset.struct_dir,
-                        template_dir=dataset.template_dir,
-                        tokenizer=dataset.tokenizer,
-                        max_templates=self.max_templates,
-                        no_template_prob=self.no_template_prob,
-                        training=False,
-                        random=random,
-                        max_tokens=len(tokenized.tokens),
-                    )
-                else:
-                    templates = load_templates(
-                        chain_ids=chain_ids,
-                        record=record,
-                        template_dir=dataset.template_dir,
-                        max_templates=self.max_templates,
-                        no_template_prob=self.no_template_prob,
-                        training=False,
-                        random=random,
-                    )
+                templates = load_templates(
+                    chain_ids=chain_ids,
+                    record=record,
+                    template_dir=dataset.template_dir,
+                    max_templates=self.max_templates,
+                    no_template_prob=self.no_template_prob,
+                    training=False,
+                    random=random,
+                )
             except Exception as e:  # noqa: BLE001
                 print(
                     f"Template loading failed for {record.id} with error {e}. Using no templates."
                 )
                 templates = None
-                if self.use_templates_v2:
-                    templates_features = load_dummy_templates_v2(
-                        tdim=self.max_templates, num_tokens=len(tokenized.tokens)
-                    )
         else:
             templates = None
-            if self.use_templates_v2:
-                templates_features = load_dummy_templates_v2(
-                    tdim=self.max_templates, num_tokens=len(tokenized.tokens)
-                )
-
         try:
             # Try to find molecules in the dataset moldir if provided
             # Find missing ones in global moldir and check if all found
@@ -1090,10 +818,8 @@ class ValidationDataset(torch.utils.data.Dataset):
                 binder_pocket_sampling_geometric_p=1.0,  # this will only sample a single pocket token
                 only_ligand_binder_pocket=True,
                 only_pp_contact=True,
-                compute_affinity=self.return_affinity,
                 single_sequence_prop=0.0,
                 use_templates=self.use_templates,
-                use_templates_v2=self.use_templates_v2,
                 max_templates=self.max_templates,
                 override_method=dataset.override_method,
                 compute_frames=self.compute_frames,
@@ -1103,9 +829,6 @@ class ValidationDataset(torch.utils.data.Dataset):
         except Exception as e:  # noqa: BLE001
             print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
             return self.__getitem__(0)
-
-        if self.use_templates_v2:
-            features.update(templates_features)
 
         # Add dataset idx
         idx_dataset = torch.tensor([idx_dataset], dtype=torch.long)
@@ -1252,8 +975,6 @@ class Boltz2TrainingDataModule(pl.LightningDataModule):
                         tokenizer=cfg.tokenizer,
                         featurizer=cfg.featurizer,
                         val_group=data_config.val_group,
-                        has_structure_label=data_config.has_structure_label,
-                        has_affinity_label=data_config.has_affinity_label,
                         symmetry_correction=data_config.symmetry_correction,
                         override_bfactor=data_config.override_bfactor,
                         override_method=data_config.override_method,
@@ -1275,8 +996,6 @@ class Boltz2TrainingDataModule(pl.LightningDataModule):
                         tokenizer=cfg.tokenizer,
                         featurizer=cfg.featurizer,
                         val_group=data_config.val_group,
-                        has_structure_label=data_config.has_structure_label,
-                        has_affinity_label=data_config.has_affinity_label,
                         symmetry_correction=data_config.symmetry_correction,
                     )
                 )
@@ -1325,11 +1044,9 @@ class Boltz2TrainingDataModule(pl.LightningDataModule):
             binder_pocket_cutoff_max=cfg.binder_pocket_cutoff_max,
             binder_pocket_sampling_geometric_p=cfg.binder_pocket_sampling_geometric_p,
             return_symmetries=cfg.return_train_symmetries,
-            return_affinity=cfg.return_train_affinity,
             single_sequence_prop=cfg.single_sequence_prop_training,
             msa_sampling=cfg.msa_sampling_training,
             use_templates=cfg.use_templates,
-            use_templates_v2=cfg.use_templates_v2,
             max_templates=cfg.max_templates_train,
             no_template_prob=cfg.no_template_prob_train,
             compute_frames=cfg.compute_frames,
@@ -1359,9 +1076,7 @@ class Boltz2TrainingDataModule(pl.LightningDataModule):
             binder_pocket_conditioned_prop=cfg.val_binder_pocket_conditioned_prop,
             contact_conditioned_prop=cfg.val_contact_conditioned_prop,
             binder_pocket_cutoff=cfg.binder_pocket_cutoff_val,
-            return_affinity=cfg.return_val_affinity,
             use_templates=cfg.use_templates,
-            use_templates_v2=cfg.use_templates_v2,
             max_templates=cfg.max_templates_val,
             no_template_prob=cfg.no_template_prob_val,
             compute_frames=cfg.compute_frames,

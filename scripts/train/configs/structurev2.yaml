@@ -13,7 +13,7 @@ trainer:
 #   project: boltz
 #   entity: boltz
 
-output: /data/fsx-data/checkpoints/jeremy/output # SET_PATH_HERE
+output: # PATH_HERE
 pretrained: null
 resume: null
 disable_checkpoint: false
@@ -25,9 +25,9 @@ data:
   datasets:
     # RCSB Data
     - _target_: boltz.data.module.trainingv2.DatasetConfig
-      target_dir: /data/fsx-data/datasets/boltz2/rcsb/targets_processed
-      msa_dir: /data/fsx-data/datasets/boltz2/rcsb/msa_processed
-      template_dir: /data/fsx-data/datasets/boltz2/rcsb/template_records
+      target_dir: #PATH_HERE
+      msa_dir: #PATH_HERE
+      template_dir: #PATH_HERE
       prob: 0.55
       filters:
         - _target_: boltz.data.filter.dynamic.size.SizeFilter
@@ -45,15 +45,13 @@ data:
         min_neighborhood: 0
         max_neighborhood: 40
       split: ./scripts/train/assets/validation_ids_v2.txt
-      has_structure_label: true
-      has_affinity_label: false
       symmetry_correction: true
       val_group: "RCSB"
 
     # AFDB Distillation Data
     - _target_: boltz.data.module.trainingv2.DatasetConfig
-      target_dir: /data/fsx-data/datasets/boltz2/afdb/targets_processed
-      msa_dir: /data/fsx-data/datasets/boltz2/afdb/msa_processed
+      target_dir: #PATH_HERE
+      msa_dir: #PATH_HERE
       template_dir: null
       prob: 0.45
       filters:
@@ -66,8 +64,6 @@ data:
         _target_: boltz.data.crop.boltz.BoltzCropper
         min_neighborhood: 0
         max_neighborhood: 40
-      has_structure_label: true
-      has_affinity_label: false
       symmetry_correction: true
       override_method: "AFDB"
       override_bfactor: true
@@ -76,11 +72,11 @@ data:
   tokenizer:
     _target_: boltz.data.tokenize.boltz2.Boltz2TrainingTokenizer
   featurizer:
-    _target_: boltz.data.feature.featurizerv2.Boltz2Featurizer
+    _target_: boltz.data.feature.featurizerv2_train.Boltz2Featurizer
 
-  moldir: /data/fsx-data/datasets/mols
-  max_tokens: 640
-  max_atoms: 5760
+  moldir: #PATH_HERE
+  max_tokens: 384  # 640
+  max_atoms: 3456 # 5760
   max_seqs: 8192
   pad_to_max_tokens: true
   pad_to_max_atoms: true
@@ -114,7 +110,7 @@ data:
   max_templates_val: 4
   no_template_prob_train: 0.6
   no_template_prob_val: 1.0
-  use_templates: true
+  use_templates: false
   msa_sampling_training: true
   bfactor_md_correction: true
 
@@ -173,11 +169,12 @@ model:
     activation_checkpointing: true
 
   pairformer_args:
-    num_blocks: 64
+    num_blocks: 48
     num_heads: 16
     dropout: 0.25
     post_layer_norm: false
     activation_checkpointing: true
+    v2: true
 
   score_model_args:
     sigma_data: 16
@@ -195,20 +192,6 @@ model:
   confidence_prediction: false
   affinity_prediction: false
   structure_prediction_training: true
-  affinity_model_args:
-    use_gaussian: false
-    num_dist_bins: 64
-    max_dist: 22
-    no_trunk_feats: false
-    add_s_to_z_prod: false
-    add_s_input_to_s: false
-    use_s_diffusion: false
-    add_z_input_to_z: false
-    confidence_args:
-      num_plddt_bins: 50
-      num_pde_bins: 64
-      num_pae_bins: 64
-      relative_confidence: none
 
   training_args:
     recycling_steps: 3
@@ -256,7 +239,6 @@ model:
 
   diffusion_loss_args:
     add_smooth_lddt_loss: true
-    add_bond_loss: false
     nucleotide_loss_weight: 5.0
     ligand_loss_weight: 10.0
     filter_by_plddt: 0.0

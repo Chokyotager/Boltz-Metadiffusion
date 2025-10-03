@@ -8,7 +8,7 @@ from torch import nn
 from torchmetrics import MeanMetric
 
 from boltz.data import const
-from boltz.model.loss.distogram import distogram_loss
+from boltz.model.loss.distogramv2 import distogram_loss
 from boltz.model.loss.inference import (
     compute_chain_clashes,
     compute_pb_flatness_metrics,
@@ -129,26 +129,10 @@ class Validator(nn.Module):
                 "contact_protein_protein",
             ]:
                 self.folding_metrics["disto_lddt"][val_idx][m_] = MeanMetric()
-                for suffix in [":recall", ":precision", ":diversity"]:
-                    m = m_ + suffix
-                    self.folding_metrics["lddt"][val_idx][m] = MeanMetric()
-                    self.folding_metrics["complex_lddt"][val_idx][m] = MeanMetric()
-                    if confidence_prediction:
-                        for k in lddt_confidence_metric_labels + mae_metric_labels:
-                            self.confidence_metrics[k][val_idx][m_] = MeanMetric()
 
             for m in const.out_single_types:
                 if confidence_prediction:
                     self.confidence_metrics["plddt_mae"][val_idx][m] = MeanMetric()
-
-            # for m in [
-            #    "rmsd",
-            #    "best_rmsd:recall",
-            #    "best_rmsd:precision",
-            #    "rmsd:diversity",
-            #    "rmsf_score",
-            # ]:
-            #    self.folding_metrics["rmsd"][val_idx][m] = MeanMetric()
 
             for m in ["disto_loss"]:
                 self.folding_metrics["disto_loss"][val_idx][m] = MeanMetric()
@@ -262,7 +246,7 @@ class Validator(nn.Module):
         K = batch["coords"].shape[1]
         true_center = batch["disto_coords_ensemble"].reshape(K, -1, 3)  # (K, L, 3)
 
-        batch["token_disto_mask"] = batch["token_disto_mask"] * batch["has_structure"]
+        batch["token_disto_mask"] = batch["token_disto_mask"]
 
         # Compute distogram lddt by looping over predicted distograms
         disto_lddt_dict = defaultdict(
@@ -373,8 +357,6 @@ class Validator(nn.Module):
                 true_atom_coords=true_coords_k,  # (multiplicity, L, 3)
                 pred_atom_coords=out["sample_atom_coords"],
                 multiplicity=n_samples,
-                representative_lddt=model.representative_lddt,
-                exclude_ions=model.exclude_ions_from_lddt,
             )
             for key in all_lddt_dict_s:
                 all_lddt_dict[key].append(all_lddt_dict_s[key])
@@ -454,123 +436,6 @@ class Validator(nn.Module):
             "double_bond_flatness": num_double_bonds,
         }
         return pb_failure_dict, pb_total_dict
-
-    def compute_best_lddt_metrics(
-        self,
-        model,
-        batch,
-        all_lddt_dict,
-        all_total_dict,
-        all_lddt_dict_div,
-        all_total_dict_div,
-        n_samples,
-    ):
-        K = batch["coords"].shape[1]
-
-        # if the multiplicity used is > 1 then we take the best lddt of the different samples
-        # AF3 combines this with the confidence based filtering
-        best_lddt_dict, best_total_dict = {}, {}
-        best_complex_lddt_dict, best_complex_total_dict = {}, {}
-        # B = true_coords.shape[0] // n_samples
-        if n_samples > 1 and batch["has_structure"].sum() > 0:
-            # NOTE: we can change the way we aggregate the lddt
-            complex_total = 0
-            complex_lddt = 0
-            for key in all_lddt_dict:
-                complex_lddt += all_lddt_dict[key] * all_total_dict[key]
-                complex_total += all_total_dict[key]
-            complex_lddt /= complex_total + 1e-7
-
-            # Take best over samples, average over conformers: recall groundtruth
-            # conformers
-            suffix = ":recall"
-            best_complex_idx = complex_lddt.argmax(dim=0)
-            for key in all_lddt_dict:
-                # take best across diffusion samples
-                best_idx = all_lddt_dict[key].argmax(dim=0)
-                best_lddt_dict[key + suffix] = all_lddt_dict[key][
-                    best_idx, torch.arange(K)
-                ].mean(dim=0)[None]  # take average across conformers in ensemble
-                best_total_dict[key + suffix] = all_total_dict[key][
-                    best_idx, torch.arange(K)
-                ].mean(dim=0)[None]
-                # mean(dim=0) since samples was argmaxed, add back batch dim
-                best_complex_lddt_dict[key + suffix] = all_lddt_dict[key][
-                    best_complex_idx, torch.arange(K)
-                ].mean(dim=0)[None]
-                best_complex_total_dict[key + suffix] = all_total_dict[key][
-                    best_complex_idx, torch.arange(K)
-                ].mean(dim=0)[None]  # sum here ? TODO
-
-            # Take best over conformers, average over samples: precision
-            suffix = ":precision"
-            best_complex_idx = complex_lddt.argmax(dim=1)
-            for key in all_lddt_dict:
-                # take best across diffusion conformers
-                best_idx = all_lddt_dict[key].argmax(dim=1)
-                best_lddt_dict[key + suffix] = all_lddt_dict[key][
-                    torch.arange(n_samples), best_idx
-                ].mean(dim=0)[None]  # take average across samples in ensemble
-                best_total_dict[key + suffix] = all_total_dict[key][
-                    torch.arange(n_samples), best_idx
-                ].mean(dim=0)[None]
-                # dim 0 since samples was argmaxed, add back batch dim [None]
-                best_complex_lddt_dict[key + suffix] = all_lddt_dict[key][
-                    torch.arange(n_samples), best_complex_idx
-                ].mean(dim=0)[None]
-                best_complex_total_dict[key + suffix] = all_total_dict[key][
-                    torch.arange(n_samples), best_complex_idx
-                ].mean(dim=0)[None]
-
-            # Diversity metrics
-            if all_lddt_dict_div is not None and all_total_dict_div is not None:
-                suffix = ":diversity"
-                for key in all_lddt_dict_div:
-                    # Take average across all samples
-                    best_lddt_dict[key + suffix] = all_lddt_dict_div[key].mean(dim=0)[
-                        None
-                    ]
-                    best_total_dict[key + suffix] = all_total_dict_div[key].mean(dim=0)[
-                        None
-                    ]
-                    best_complex_lddt_dict[key + suffix] = all_lddt_dict_div[key].mean(
-                        dim=0
-                    )[None]  # complex_lddt same as lddt
-                    best_complex_total_dict[key + suffix] = all_total_dict_div[
-                        key
-                    ].mean(dim=0)[None]
-        else:
-            # Take average across conformers in ensemble.
-            for key in all_lddt_dict:
-                for suffix in [":recall", ":precision"]:
-                    best_lddt_dict[key + suffix] = (
-                        all_lddt_dict[key].max(dim=1).values[None]
-                    )  # (sample, K) -> (B=1, samples=1)
-                    best_total_dict[key + suffix] = (
-                        all_total_dict[key].max(dim=1).values[None]
-                    )
-                    best_complex_lddt_dict[key + suffix] = (
-                        all_lddt_dict[key].max(dim=1).values[None]
-                    )
-                    best_complex_total_dict[key + suffix] = (
-                        all_total_dict[key].max(dim=1).values[None]
-                    )
-                suffix = ":diversity"
-                best_lddt_dict[key + suffix] = torch.tensor([0.0]).to(model.device)
-                best_total_dict[key + suffix] = torch.tensor([1.0]).to(model.device)
-                best_complex_lddt_dict[key + suffix] = torch.tensor([0.0]).to(
-                    model.device
-                )
-                best_complex_total_dict[key + suffix] = torch.tensor([1.0]).to(
-                    model.device
-                )
-
-        return (
-            best_lddt_dict,
-            best_total_dict,
-            best_complex_lddt_dict,
-            best_complex_total_dict,
-        )
 
     def get_confidence_metrics(
         self,
@@ -784,11 +649,6 @@ class Validator(nn.Module):
         batch,
         disto_lddt_dict,
         disto_total_dict,
-        best_lddt_dict,
-        best_total_dict,
-        best_complex_lddt_dict,
-        best_complex_total_dict,
-        # rmsds,
         idx_dataset,
         return_dict,
     ):
@@ -803,26 +663,10 @@ class Validator(nn.Module):
                     self.folding_metrics["disto_lddt"][idx_dataset][
                         "pocket_ligand_protein"
                     ].update(disto_lddt_dict[m_], disto_total_dict[m_])
-                    for suffix in [":recall", ":precision", ":diversity"]:
-                        m = m_ + suffix
-                        self.folding_metrics["lddt"][idx_dataset][
-                            "pocket_ligand_protein" + suffix
-                        ].update(best_lddt_dict[m], best_total_dict[m])
-                        self.folding_metrics["complex_lddt"][idx_dataset][
-                            "pocket_ligand_protein" + suffix
-                        ].update(best_complex_lddt_dict[m], best_complex_total_dict[m])
                 else:
                     self.folding_metrics["disto_lddt"][idx_dataset][
                         "ligand_protein"
                     ].update(disto_lddt_dict[m_], disto_total_dict[m_])
-                    for suffix in [":recall", ":precision", ":diversity"]:
-                        m = m_ + suffix
-                        self.folding_metrics["lddt"][idx_dataset][
-                            "ligand_protein" + suffix
-                        ].update(best_lddt_dict[m], best_total_dict[m])
-                        self.folding_metrics["complex_lddt"][idx_dataset][
-                            "ligand_protein" + suffix
-                        ].update(best_complex_lddt_dict[m], best_complex_total_dict[m])
 
             elif m_ == "protein_protein":
                 if torch.any(
@@ -833,61 +677,15 @@ class Validator(nn.Module):
                     self.folding_metrics["disto_lddt"][idx_dataset][
                         "contact_protein_protein"
                     ].update(disto_lddt_dict[m_], disto_total_dict[m_])
-                    for suffix in [":recall", ":precision", ":diversity"]:
-                        m = m_ + suffix
-                        self.folding_metrics["lddt"][idx_dataset][
-                            "contact_protein_protein" + suffix
-                        ].update(best_lddt_dict[m], best_total_dict[m])
-                        self.folding_metrics["complex_lddt"][idx_dataset][
-                            "contact_protein_protein" + suffix
-                        ].update(best_complex_lddt_dict[m], best_complex_total_dict[m])
                 else:
                     self.folding_metrics["disto_lddt"][idx_dataset][
                         "protein_protein"
                     ].update(disto_lddt_dict[m_], disto_total_dict[m_])
-                    for suffix in [":recall", ":precision", ":diversity"]:
-                        m = m_ + suffix
-                        self.folding_metrics["lddt"][idx_dataset][
-                            "protein_protein" + suffix
-                        ].update(best_lddt_dict[m], best_total_dict[m])
-                        self.folding_metrics["complex_lddt"][idx_dataset][
-                            "protein_protein" + suffix
-                        ].update(best_complex_lddt_dict[m], best_complex_total_dict[m])
 
             else:
                 self.folding_metrics["disto_lddt"][idx_dataset][m_].update(
                     disto_lddt_dict[m_], disto_total_dict[m_]
                 )
-                for suffix in [":recall", ":precision", ":diversity"]:
-                    m = m_ + suffix
-                    self.folding_metrics["lddt"][idx_dataset][m].update(
-                        best_lddt_dict[m], best_total_dict[m]
-                    )
-                    self.folding_metrics["complex_lddt"][idx_dataset][m].update(
-                        best_complex_lddt_dict[m], best_complex_total_dict[m]
-                    )
-
-        # self.folding_metrics["rmsd"][idx_dataset]["rmsd"].update(rmsds)
-
-        # RMSD metrics
-        # if "best_rmsd_recall" in return_dict:
-        #    best_rmsd_recall = return_dict["best_rmsd_recall"]
-        #    self.folding_metrics["rmsd"][idx_dataset]["best_rmsd:recall"].update(
-        #        best_rmsd_recall
-        #    )
-        # if "best_rmsd_precision" in return_dict:
-        #    best_rmsd_precision = return_dict["best_rmsd_precision"]
-        #    self.folding_metrics["rmsd"][idx_dataset]["best_rmsd:precision"].update(
-        #        best_rmsd_precision
-        #    )
-        # if "rmsd_diversity" in return_dict:
-        #    rmsd_diversity = return_dict["rmsd_diversity"]
-        #    self.folding_metrics["rmsd"][idx_dataset]["rmsd:diversity"].update(
-        #        rmsd_diversity
-        #    )
-        # if "rmsf_score" in return_dict:
-        #    rmsf_score = return_dict["rmsf_score"]
-        #    self.folding_metrics["rmsd"][idx_dataset]["rmsf_score"].update(rmsf_score)
 
     def update_physcialism_metrics(
         self,
@@ -953,12 +751,6 @@ class Validator(nn.Module):
             expand_to_diffusion_samples=expand_to_diffusion_samples,
         )
 
-        # Get diversity metrics
-        # if n_samples > 1:
-        #    return_dict = self.get_diversity_metrics(
-        #        batch, out, idx_dataset, return_dict, n_samples
-        #    )
-
         # Move this and do better as to when to interleave
         true_coords = return_dict[
             "true_coords"
@@ -980,19 +772,6 @@ class Validator(nn.Module):
             expand_to_diffusion_samples,
         )
 
-        # Get diversity lddt metrics
-        all_lddt_dict_div, all_total_dict_div = None, None
-        if n_samples > 1:
-            all_lddt_dict_div, all_total_dict_div = self.get_diversity_lddt_metrics(
-                model,
-                batch,
-                out,
-                idx_dataset,
-                n_samples,
-                true_coords_resolved_mask,
-                expand_to_diffusion_samples,
-            )
-
         # Get physical realism metrics
         if self.physicalism_metrics:
             pair_clash_dict, pair_total_dict = self.get_clash_metrics(
@@ -1007,22 +786,6 @@ class Validator(nn.Module):
             pair_clash_dict, pair_total_dict = None, None
             pb_failure_dict, pb_total_dict = None, None
 
-        # Compute best lddt metrics based on oracle lddt and
-        # average across conformers
-        (
-            best_lddt_dict,
-            best_total_dict,
-            best_complex_lddt_dict,
-            best_complex_total_dict,
-        ) = self.compute_best_lddt_metrics(
-            model,
-            batch,
-            all_lddt_dict,
-            all_total_dict,
-            all_lddt_dict_div,
-            all_total_dict_div,
-            n_samples,
-        )
         # Filtering based on confidence
         if model.confidence_prediction and n_samples > 1:
             (
@@ -1053,11 +816,6 @@ class Validator(nn.Module):
             batch,
             disto_lddt_dict,
             disto_total_dict,
-            best_lddt_dict,
-            best_total_dict,
-            best_complex_lddt_dict,
-            best_complex_total_dict,
-            # rmsds,
             idx_dataset,
             return_dict,
         )
@@ -1105,19 +863,7 @@ class Validator(nn.Module):
         avg_pb = [{} for _ in range(self.num_val_datasets)]
 
         if model.confidence_prediction:
-            avg_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-            avg_iplddt_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-            avg_pde_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-            avg_ipde_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-            avg_ptm_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-            avg_iptm_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-            avg_ligand_iptm_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-            avg_protein_iptm_top1_lddt = [{} for _ in range(self.num_val_datasets)]
-
-            avg_avg_lddt = [{} for _ in range(self.num_val_datasets)]
             avg_mae_plddt = [{} for _ in range(self.num_val_datasets)]
-            avg_mae_pde = [{} for _ in range(self.num_val_datasets)]
-            avg_mae_pae = [{} for _ in range(self.num_val_datasets)]
             avg_avg_clash = [{} for _ in range(self.num_val_datasets)]
             avg_avg_pb = [{} for _ in range(self.num_val_datasets)]
 
@@ -1167,212 +913,6 @@ class Validator(nn.Module):
                     avg_disto_lddt[idx_dataset][m_],
                 )
 
-                # TODO: this is hardcoded for now to RCSB compare with Boltz-1 metrics
-                # RCSB recall == preicion
-                suffixes = (
-                    [":recall", ":diversity"]
-                    if dataset_name_ori == "RCSB"
-                    else [":recall", ":precision", ":diversity"]
-                )
-                for suffix in suffixes:
-                    m = m_ + suffix
-
-                    # TODO: this is hardcoded for now to RCSB compare with Boltz-1
-                    # metrics
-                    if dataset_name_ori == "RCSB" and suffix == ":recall":
-                        # We want recall to not show suffix when logging for RCSB
-                        m_label = m_
-                    else:
-                        # Append suffix otherwise
-                        m_label = m
-
-                    # TODO remove this
-                    # if self.folding_metrics["lddt"][idx_dataset][m].weight > 1:
-                    avg_lddt[idx_dataset][m] = self.folding_metrics["lddt"][
-                        idx_dataset
-                    ][m].compute()
-                    avg_lddt[idx_dataset][m] = (
-                        0.0
-                        if torch.isnan(avg_lddt[idx_dataset][m])
-                        else avg_lddt[idx_dataset][m].item()
-                    )
-                    self.folding_metrics["lddt"][idx_dataset][m].reset()
-                    model.log(
-                        f"val/lddt_{m_label}{dataset_name}",
-                        avg_lddt[idx_dataset][m],
-                    )
-
-                    avg_complex_lddt[idx_dataset][m] = self.folding_metrics[
-                        "complex_lddt"
-                    ][idx_dataset][m].compute()
-                    avg_complex_lddt[idx_dataset][m] = (
-                        0.0
-                        if torch.isnan(avg_complex_lddt[idx_dataset][m])
-                        else avg_complex_lddt[idx_dataset][m].item()
-                    )
-                    self.folding_metrics["complex_lddt"][idx_dataset][m].reset()
-                    model.log(
-                        f"val/complex_lddt_{m_label}{dataset_name}",
-                        avg_complex_lddt[idx_dataset][m],
-                    )
-
-                if model.confidence_prediction:
-                    avg_top1_lddt[idx_dataset][m_] = self.confidence_metrics[
-                        "top1_lddt"
-                    ][idx_dataset][m_].compute()
-                    avg_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_top1_lddt[idx_dataset][m_])
-                        else avg_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["top1_lddt"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/top1_lddt_{m_}{dataset_name}",
-                        avg_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_iplddt_top1_lddt[idx_dataset][m_] = self.confidence_metrics[
-                        "iplddt_top1_lddt"
-                    ][idx_dataset][m_].compute()
-                    avg_iplddt_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_iplddt_top1_lddt[idx_dataset][m_])
-                        else avg_iplddt_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["iplddt_top1_lddt"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/iplddt_top1_lddt_{m_}{dataset_name}",
-                        avg_iplddt_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_pde_top1_lddt[idx_dataset][m_] = self.confidence_metrics[
-                        "pde_top1_lddt"
-                    ][idx_dataset][m_].compute()
-                    avg_pde_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_pde_top1_lddt[idx_dataset][m_])
-                        else avg_pde_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["pde_top1_lddt"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/pde_top1_lddt_{m_}{dataset_name}",
-                        avg_pde_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_ipde_top1_lddt[idx_dataset][m_] = self.confidence_metrics[
-                        "ipde_top1_lddt"
-                    ][idx_dataset][m_].compute()
-                    avg_ipde_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_ipde_top1_lddt[idx_dataset][m_])
-                        else avg_ipde_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["ipde_top1_lddt"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/ipde_top1_lddt_{m_}{dataset_name}",
-                        avg_ipde_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_ptm_top1_lddt[idx_dataset][m_] = self.confidence_metrics[
-                        "ptm_top1_lddt"
-                    ][idx_dataset][m_].compute()
-                    avg_ptm_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_ptm_top1_lddt[idx_dataset][m_])
-                        else avg_ptm_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["ptm_top1_lddt"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/ptm_top1_lddt_{m_}{dataset_name}",
-                        avg_ptm_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_iptm_top1_lddt[idx_dataset][m_] = self.confidence_metrics[
-                        "iptm_top1_lddt"
-                    ][idx_dataset][m_].compute()
-                    avg_iptm_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_iptm_top1_lddt[idx_dataset][m_])
-                        else avg_iptm_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["iptm_top1_lddt"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/iptm_top1_lddt_{m_}{dataset_name}",
-                        avg_iptm_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_ligand_iptm_top1_lddt[idx_dataset][m_] = (
-                        self.confidence_metrics["ligand_iptm_top1_lddt"][idx_dataset][
-                            m_
-                        ].compute()
-                    )
-                    avg_ligand_iptm_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_ligand_iptm_top1_lddt[idx_dataset][m_])
-                        else avg_ligand_iptm_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["ligand_iptm_top1_lddt"][idx_dataset][
-                        m_
-                    ].reset()
-                    model.log(
-                        f"val/ligand_iptm_top1_lddt_{m_}{dataset_name}",
-                        avg_ligand_iptm_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_protein_iptm_top1_lddt[idx_dataset][m_] = (
-                        self.confidence_metrics["protein_iptm_top1_lddt"][idx_dataset][
-                            m_
-                        ].compute()
-                    )
-                    avg_protein_iptm_top1_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_protein_iptm_top1_lddt[idx_dataset][m_])
-                        else avg_protein_iptm_top1_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["protein_iptm_top1_lddt"][idx_dataset][
-                        m_
-                    ].reset()
-                    model.log(
-                        f"val/protein_iptm_top1_lddt_{m_}{dataset_name}",
-                        avg_protein_iptm_top1_lddt[idx_dataset][m_],
-                    )
-
-                    avg_avg_lddt[idx_dataset][m_] = self.confidence_metrics["avg_lddt"][
-                        idx_dataset
-                    ][m_].compute()
-                    avg_avg_lddt[idx_dataset][m_] = (
-                        0.0
-                        if torch.isnan(avg_avg_lddt[idx_dataset][m_])
-                        else avg_avg_lddt[idx_dataset][m_].item()
-                    )
-                    self.confidence_metrics["avg_lddt"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/avg_lddt_{m_}{dataset_name}",
-                        avg_avg_lddt[idx_dataset][m_],
-                    )
-
-                    avg_mae_pde[idx_dataset][m_] = (
-                        self.confidence_metrics["pde_mae"][idx_dataset][m_]
-                        .compute()
-                        .item()
-                    )
-                    self.confidence_metrics["pde_mae"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/MAE_pde_{m_}{dataset_name}",
-                        avg_mae_pde[idx_dataset][m_],
-                    )
-
-                    avg_mae_pae[idx_dataset][m_] = (
-                        self.confidence_metrics["pae_mae"][idx_dataset][m_]
-                        .compute()
-                        .item()
-                    )
-                    self.confidence_metrics["pae_mae"][idx_dataset][m_].reset()
-                    model.log(
-                        f"val/MAE_pae_{m_}{dataset_name}",
-                        avg_mae_pae[idx_dataset][m_],
-                    )
-
             for m in const.out_single_types:
                 if model.confidence_prediction:
                     avg_mae_plddt[idx_dataset][m] = (
@@ -1394,152 +934,6 @@ class Validator(nn.Module):
                 f"val/disto_lddt{dataset_name}",
                 overall_disto_lddt,
             )
-
-            # TODO: this is hardcoded for now to RCSB compare with Boltz-1 metrics
-            # RCSB recall == preicion and diversity is not defined.
-            suffixes = (
-                [":recall", ":diversity"]
-                if dataset_name_ori == "RCSB"
-                else [":recall", ":precision", ":diversity"]
-            )
-
-            for suffix in suffixes:
-                # TODO: this is hardcoded for now to RCSB compare with Boltz-1
-                # metrics
-                if dataset_name_ori == "RCSB" and suffix == ":recall":
-                    # We want recall to not show suffix when logging for RCSB
-                    suffix_label = ""
-                else:
-                    # Append suffix otherwise
-                    suffix_label = suffix
-
-                # TODO REMOVE DEBUG HERE
-                # if m + suffix in avg_lddt[idx_dataset]:
-                overall_lddt = sum(
-                    avg_lddt[idx_dataset][m + suffix] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/lddt{suffix_label}{dataset_name}",
-                    overall_lddt,
-                )
-
-                overall_complex_lddt = sum(
-                    avg_complex_lddt[idx_dataset][m + suffix] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/complex_lddt{suffix_label}{dataset_name}",
-                    overall_complex_lddt,
-                )
-
-            if model.confidence_prediction:
-                overall_top1_lddt = sum(
-                    avg_top1_lddt[idx_dataset][m] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/top1_lddt{dataset_name}",
-                    overall_top1_lddt,
-                )
-
-                overall_iplddt_top1_lddt = sum(
-                    avg_iplddt_top1_lddt[idx_dataset][m] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/iplddt_top1_lddt{dataset_name}",
-                    overall_iplddt_top1_lddt,
-                )
-
-                overall_pde_top1_lddt = sum(
-                    avg_pde_top1_lddt[idx_dataset][m] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/pde_top1_lddt{dataset_name}",
-                    overall_pde_top1_lddt,
-                )
-
-                overall_ipde_top1_lddt = sum(
-                    avg_ipde_top1_lddt[idx_dataset][m] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/ipde_top1_lddt{dataset_name}",
-                    overall_ipde_top1_lddt,
-                )
-
-                overall_ptm_top1_lddt = sum(
-                    avg_ptm_top1_lddt[idx_dataset][m] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/ptm_top1_lddt{dataset_name}",
-                    overall_ptm_top1_lddt,
-                )
-
-                overall_iptm_top1_lddt = sum(
-                    avg_iptm_top1_lddt[idx_dataset][m] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/iptm_top1_lddt{dataset_name}",
-                    overall_iptm_top1_lddt,
-                )
-
-                overall_avg_lddt = sum(
-                    avg_avg_lddt[idx_dataset][m] * w
-                    for (m, w) in const.out_types_weights.items()
-                ) / sum(const.out_types_weights.values())
-                model.log(
-                    f"val/avg_lddt{dataset_name}",
-                    overall_avg_lddt,
-                )
-
-            # RMSD metrics
-            # model.log(
-            #    f"val/rmsd{dataset_name}",
-            #    self.folding_metrics["rmsd"][idx_dataset]["rmsd"].compute(),
-            # )
-            # self.folding_metrics["rmsd"][idx_dataset]["rmsd"].reset()
-
-            # if self.folding_metrics["rmsd"][idx_dataset]["best_rmsd:recall"].weight > 0:
-            #    model.log(
-            #        f"val/best_rmsd_recall{dataset_name}",
-            #        self.folding_metrics["rmsd"][idx_dataset][
-            #            "best_rmsd:recall"
-            #        ].compute(),
-            #    )
-            #    self.folding_metrics["rmsd"][idx_dataset]["best_rmsd:recall"].reset()
-
-            # if (
-            #    self.folding_metrics["rmsd"][idx_dataset]["best_rmsd:precision"].weight
-            #    > 0
-            # ):
-            #    model.log(
-            #        f"val/best_rmsd_precision{dataset_name}",
-            #        self.folding_metrics["rmsd"][idx_dataset][
-            #            "best_rmsd:precision"
-            #        ].compute(),
-            #    )
-            #    self.folding_metrics["rmsd"][idx_dataset]["best_rmsd:precision"].reset()
-
-            # if self.folding_metrics["rmsd"][idx_dataset]["rmsd:diversity"].weight > 0:
-            #   model.log(
-            #        f"val/rmsd_diversity{dataset_name}",
-            #        self.folding_metrics["rmsd"][idx_dataset][
-            #            "rmsd:diversity"
-            #        ].compute(),
-            #    )
-            #    self.folding_metrics["rmsd"][idx_dataset]["rmsd:diversity"].reset()
-
-            # if self.folding_metrics["rmsd"][idx_dataset]["rmsf_score"].weight > 0:
-            #    model.log(
-            #        f"val/rmsf_score{dataset_name}",
-            #        self.folding_metrics["rmsd"][idx_dataset]["rmsf_score"].compute(),
-            #    )
-            #    self.folding_metrics["rmsd"][idx_dataset]["rmsf_score"].reset()
 
             # Distogram loss
             r = self.folding_metrics["disto_loss"][idx_dataset]["disto_loss"].compute()

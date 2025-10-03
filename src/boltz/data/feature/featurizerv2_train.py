@@ -1,7 +1,7 @@
 import math
-from collections import deque
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
+import networkx as nx
 import numba
 import numpy as np
 import numpy.typing as npt
@@ -22,11 +22,10 @@ from boltz.data.mol import (
 from boltz.data.pad import pad_dim
 from boltz.data.types import (
     MSA,
+    Input,
     MSADeletion,
     MSAResidue,
     MSASequence,
-    TemplateInfo,
-    Tokenized,
 )
 from boltz.model.modules.utils import center_random_augmentation
 
@@ -35,7 +34,7 @@ from boltz.model.modules.utils import center_random_augmentation
 ####################################################################################################
 
 
-def convert_atom_name(name: str) -> tuple[int, int, int, int]:
+def convert_atom_name(name: str) -> Tuple[int, int, int, int]:
     """Convert an atom name to a standard format.
 
     Parameters
@@ -45,7 +44,7 @@ def convert_atom_name(name: str) -> tuple[int, int, int, int]:
 
     Returns
     -------
-    tuple[int, int, int, int]
+    Tuple[int, int, int, int]
         The converted atom name.
 
     """
@@ -95,30 +94,34 @@ def sample_d(
 
 
 def compute_frames_nonpolymer(
-    data: Tokenized,
+    data: Input,
     coords,
     resolved_mask,
     atom_to_token,
-    frame_data: list,
-    resolved_frame_data: list,
-) -> tuple[list, list]:
+    frame_data: List,
+    resolved_frame_data: List,
+) -> Tuple[List, List]:
     """Get the frames for non-polymer tokens.
 
     Parameters
     ----------
-    data : Tokenized
+    data : Input
         The input data to the model.
-    frame_data : list
+    frame_data : List
         The frame data.
-    resolved_frame_data : list
+    resolved_frame_data : List
         The resolved frame data.
 
     Returns
     -------
-    tuple[list, list]
+    Tuple[List, List]
         The frame data and resolved frame data.
 
     """
+    ## assert coords.shape[0] == 1, "No support for ensembles yet"
+    # print("Warning: Frames are only using first conformer! For debug.")
+    # coords = coords[0]
+
     frame_data = np.array(frame_data)
     resolved_frame_data = np.array(resolved_frame_data)
     asym_id_token = data.tokens["asym_id"]
@@ -212,18 +215,18 @@ def dummy_msa(residues: np.ndarray) -> MSA:
 
 
 def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
-    data: Tokenized,
+    data: Input,
     random: np.random.Generator,
     max_seqs: int,
     max_pairs: int = 8192,
     max_total: int = 16384,
     random_subset: bool = False,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor]:
     """Pair the MSA data.
 
     Parameters
     ----------
-    data : Tokenized
+    data : Input
         The input data to the model.
 
     Returns
@@ -241,7 +244,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     chain_ids = np.unique(data.tokens["asym_id"])
 
     # Get relevant MSA, and create a dummy for chains without
-    msa: dict[int, MSA] = {}
+    msa: Dict[int, MSA] = {}
     for chain_id in chain_ids:
         # Get input sequence
         chain = data.structure.chains[chain_id]
@@ -301,7 +304,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
             msa[chain_id] = dummy_msa(residues)
 
     # Map taxonomies to (chain_id, seq_idx)
-    taxonomy_map: dict[str, list] = {}
+    taxonomy_map: Dict[str, List] = {}
     for chain_id, chain_msa in msa.items():
         sequences = chain_msa.sequences
         sequences = sequences[sequences["taxonomy"] != -1]
@@ -324,9 +327,9 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     visited = {(c, s) for c, items in taxonomy_map for s in items}
     available = {}
     for c in chain_ids:
-        available[c] = deque(
+        available[c] = [
             i for i in range(1, len(msa[c].sequences)) if (c, i) not in visited
-        )
+        ]
 
     # Create sequence pairs
     is_paired = []
@@ -366,7 +369,8 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
                     row_is_paired[chain_id] = 0
                     if available[chain_id]:
                         # Add the next available sequence
-                        row_pairing[chain_id] = available[chain_id].popleft()
+                        seq_idx = available[chain_id].pop(0)
+                        row_pairing[chain_id] = seq_idx
                     else:
                         # No more sequences available, we place a gap
                         row_pairing[chain_id] = -1
@@ -391,7 +395,8 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
             row_is_paired[chain_id] = 0
             if available[chain_id]:
                 # Add the next available sequence
-                row_pairing[chain_id] = available[chain_id].popleft()
+                seq_idx = available[chain_id].pop(0)
+                row_pairing[chain_id] = seq_idx
             else:
                 # No more sequences available, we place a gap
                 row_pairing[chain_id] = -1
@@ -419,23 +424,18 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
         is_paired = is_paired[:max_seqs]
 
     # Map (chain_id, seq_idx, res_idx) to deletion
-    deletions = numba.typed.Dict.empty(
-        key_type=numba.types.Tuple(
-            [numba.types.int64, numba.types.int64, numba.types.int64]
-        ),
-        value_type=numba.types.int64,
-    )
+    deletions = {}
     for chain_id, chain_msa in msa.items():
         chain_deletions = chain_msa.deletions
         for sequence in chain_msa.sequences:
-            seq_idx = sequence["seq_idx"]
             del_start = sequence["del_start"]
             del_end = sequence["del_end"]
-            chain_deletions = chain_deletions[del_start:del_end]
+            chain_deletions = chain_msa.deletions[del_start:del_end]
             for deletion_data in chain_deletions:
+                seq_idx = sequence["seq_idx"]
                 res_idx = deletion_data["res_idx"]
-                deletion_values = deletion_data["deletion"]
-                deletions[(chain_id, seq_idx, res_idx)] = deletion_values
+                deletion = deletion_data["deletion"]
+                deletions[(chain_id, seq_idx, res_idx)] = deletion
 
     # Add all the token MSA data
     msa_data, del_data, paired_data = prepare_msa_arrays(
@@ -496,13 +496,21 @@ def prepare_msa_arrays(
         chain_idx = chain_id_to_idx[chain_id]
         msa_residues[chain_idx, idxs] = residues
 
+    deletions_dict = numba.typed.Dict.empty(
+        key_type=numba.types.Tuple(
+            [numba.types.int64, numba.types.int64, numba.types.int64]
+        ),
+        value_type=numba.types.int64,
+    )
+    deletions_dict.update(deletions)
+
     return _prepare_msa_arrays_inner(
         token_asym_ids_arr,
         token_res_idxs_arr,
         token_asym_ids_idx_arr,
         pairing_arr,
         is_paired_arr,
-        deletions,
+        deletions_dict,
         msa_sequences,
         msa_residues,
         const.token_ids["-"],
@@ -594,7 +602,7 @@ def select_subset_from_mask(mask, p, random: np.random.Generator) -> np.ndarray:
     return new_mask
 
 
-def get_range_bin(value: float, range_dict: dict[tuple[float, float], int], default=0):
+def get_range_bin(value: float, range_dict: Dict[Tuple[float, float], int], default=0):
     """Get the bin of a value given a range dictionary."""
     value = float(value)
     for k, idx in range_dict.items():
@@ -607,7 +615,7 @@ def get_range_bin(value: float, range_dict: dict[tuple[float, float], int], defa
 
 
 def process_token_features(  # noqa: C901, PLR0915, PLR0912
-    data: Tokenized,
+    data: Input,
     random: np.random.Generator,
     max_tokens: Optional[int] = None,
     binder_pocket_conditioned_prop: Optional[float] = 0.0,
@@ -617,26 +625,21 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     binder_pocket_sampling_geometric_p: Optional[float] = 0.0,
     only_ligand_binder_pocket: Optional[bool] = False,
     only_pp_contact: Optional[bool] = False,
-    inference_pocket_constraints: Optional[
-        list[tuple[int, list[tuple[int, int]], float]]
-    ] = False,
-    inference_contact_constraints: Optional[
-        list[tuple[tuple[int, int], tuple[int, int], float]]
-    ] = False,
+    maximum_bond_distance: Optional[int] = 0,
     override_method: Optional[str] = None,
-) -> dict[str, Tensor]:
+) -> Dict[str, Tensor]:
     """Get the token features.
 
     Parameters
     ----------
-    data : Tokenized
+    data : Input
         The input data to the model.
     max_tokens : int
         The maximum number of tokens.
 
     Returns
     -------
-    dict[str, Tensor]
+    Dict[str, Tensor]
         The token features.
 
     """
@@ -655,20 +658,18 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     res_type = one_hot(res_type, num_classes=const.num_tokens)
     disto_center = from_numpy(token_data["disto_coords"])
     modified = from_numpy(token_data["modified"]).long()  # float()
-    cyclic_period = from_numpy(token_data["cyclic_period"].copy())
-    affinity_mask = from_numpy(token_data["affinity_mask"]).float()
 
     ## Conditioning features ##
     method = (
         np.zeros(len(token_data))
         + const.method_types_ids[
-            (
-                "x-ray diffraction"
-                if override_method is None
-                else override_method.lower()
-            )
+            ("other" if override_method is None else override_method.lower())
         ]
     )
+    default_T = const.temperature_bins_ids["other"]
+    default_pH = const.ph_bins_ids["other"]
+    temp_feature = np.zeros(len(token_data)) + default_T
+    ph_feature = np.zeros(len(token_data)) + default_pH
     if data.record is not None:
         if (
             override_method is None
@@ -679,7 +680,32 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
                 data.record.structure.method.lower()
             ]
 
+        if data.record.md is not None:
+            if data.record.md.temperature is not None:
+                T = data.record.md.temperature
+                temp_feature = (temp_feature * 0) + get_range_bin(
+                    T, const.temperature_bins_ids, default=default_T
+                )
+            if data.record.md.pH is not None:
+                pH = data.record.md.pH
+                ph_feature = (ph_feature * 0) + get_range_bin(
+                    pH, const.ph_bins_ids, default=default_pH
+                )
+        else:
+            if data.record.structure.temperature is not None:
+                T = data.record.structure.temperature
+                temp_feature = (temp_feature * 0) + get_range_bin(
+                    T, const.temperature_bins_ids, default=default_T
+                )
+            if data.record.structure.pH is not None:
+                pH = data.record.structure.pH
+                ph_feature = (ph_feature * 0) + get_range_bin(
+                    pH, const.ph_bins_ids, default=default_pH
+                )
+
     method_feature = from_numpy(method).long()
+    temp_feature = from_numpy(temp_feature).long()
+    ph_feature = from_numpy(ph_feature).long()
 
     # Token mask features
     pad_mask = torch.ones(len(token_data), dtype=torch.float)
@@ -705,7 +731,20 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         bonds_type[token_1, token_2] = bond_type
         bonds_type[token_2, token_1] = bond_type
 
-    bonds = bonds.unsqueeze(-1)
+    if maximum_bond_distance > 1:
+        G = nx.from_numpy_array(bonds.numpy())
+        shortest_path = nx.floyd_warshall_numpy(G)
+        shortest_path = np.where(
+            shortest_path > shortest_path.shape[0],
+            maximum_bond_distance + 1,
+            np.minimum(shortest_path, maximum_bond_distance),
+        )
+        bonds = one_hot(
+            torch.from_numpy(shortest_path).long(),
+            num_classes=maximum_bond_distance + 2,
+        )
+    else:
+        bonds = bonds.unsqueeze(-1)
 
     # Pocket conditioned feature
     contact_conditioning = (
@@ -713,56 +752,6 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         + const.contact_conditioning_info["UNSELECTED"]
     )
     contact_threshold = np.zeros((len(token_data), len(token_data)))
-
-    if inference_pocket_constraints is not None:
-        for binder, contacts, max_distance, force in inference_pocket_constraints:
-            binder_mask = token_data["asym_id"] == binder
-
-            for idx, token in enumerate(token_data):
-                if (
-                    token["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                    and (token["asym_id"], token["res_idx"]) in contacts
-                ) or (
-                    token["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                    and (token["asym_id"], token["atom_idx"]) in contacts
-                ):
-                    contact_conditioning[binder_mask, idx] = (
-                        const.contact_conditioning_info["BINDER>POCKET"]
-                    )
-                    contact_conditioning[idx, binder_mask] = (
-                        const.contact_conditioning_info["POCKET>BINDER"]
-                    )
-                    contact_threshold[binder_mask, idx] = max_distance
-                    contact_threshold[idx, binder_mask] = max_distance
-
-    if inference_contact_constraints is not None:
-        for token1, token2, max_distance, force in inference_contact_constraints:
-            for idx1, _token1 in enumerate(token_data):
-                if (
-                    _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                    and (_token1["asym_id"], _token1["res_idx"]) == token1
-                ) or (
-                    _token1["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                    and (_token1["asym_id"], _token1["atom_idx"]) == token1
-                ):
-                    for idx2, _token2 in enumerate(token_data):
-                        if (
-                            _token2["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                            and (_token2["asym_id"], _token2["res_idx"]) == token2
-                        ) or (
-                            _token2["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                            and (_token2["asym_id"], _token2["atom_idx"]) == token2
-                        ):
-                            contact_conditioning[idx1, idx2] = (
-                                const.contact_conditioning_info["CONTACT"]
-                            )
-                            contact_conditioning[idx2, idx1] = (
-                                const.contact_conditioning_info["CONTACT"]
-                            )
-                            contact_threshold[idx1, idx2] = max_distance
-                            contact_threshold[idx2, idx1] = max_distance
-                            break
-                    break
 
     if binder_pocket_conditioned_prop > 0.0:
         # choose as binder a random ligand in the crop, if there are no ligands select a protein chain
@@ -1059,9 +1048,6 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         )
     ).float()
 
-    # cyclic period is either computed from the bonds or given as input flag
-    cyclic_period = torch.maximum(cyclic, cyclic_period)
-
     # Pad to max tokens if given
     if max_tokens is not None:
         pad_len = max_tokens - len(token_data)
@@ -1082,9 +1068,10 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
             contact_threshold = pad_dim(contact_threshold, 0, pad_len)
             contact_threshold = pad_dim(contact_threshold, 1, pad_len)
             method_feature = pad_dim(method_feature, 0, pad_len)
+            temp_feature = pad_dim(temp_feature, 0, pad_len)
+            ph_feature = pad_dim(ph_feature, 0, pad_len)
             modified = pad_dim(modified, 0, pad_len)
-            cyclic_period = pad_dim(cyclic_period, 0, pad_len)
-            affinity_mask = pad_dim(affinity_mask, 0, pad_len)
+            cyclic = pad_dim(cyclic, 0, pad_len)
 
     token_features = {
         "token_index": token_index,
@@ -1103,19 +1090,20 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         "contact_conditioning": contact_conditioning,
         "contact_threshold": contact_threshold,
         "method_feature": method_feature,
+        "temp_feature": temp_feature,
+        "ph_feature": ph_feature,
         "modified": modified,
-        "cyclic_period": cyclic_period,
-        "affinity_token_mask": affinity_mask,
+        "cyclic_period": cyclic,
     }
 
     return token_features
 
 
 def process_atom_features(
-    data: Tokenized,
+    data: Input,
     random: np.random.Generator,
-    ensemble_features: dict,
-    molecules: dict[str, Mol],
+    ensemble_features: Dict,
+    molecules: Dict[str, Mol],
     atoms_per_window_queries: int = 32,
     min_dist: float = 2.0,
     max_dist: float = 22.0,
@@ -1127,19 +1115,19 @@ def process_atom_features(
     compute_frames: bool = False,
     override_coords: Optional[Tensor] = None,
     bfactor_md_correction: bool = False,
-) -> dict[str, Tensor]:
+) -> Dict[str, Tensor]:
     """Get the atom features.
 
     Parameters
     ----------
-    data : Tokenized
+    data : Input
         The input to the model.
     max_atoms : int, optional
         The maximum number of atoms.
 
     Returns
     -------
-    dict[str, Tensor]
+    Dict[str, Tensor]
         The atom features.
 
     """
@@ -1160,7 +1148,6 @@ def process_atom_features(
     r_set_to_rep_atom = []
     disto_coords_ensemble = []
     backbone_feat_index = []
-    token_to_center_atom = []
 
     e_offsets = data.structure.ensemble["atom_coord_idx"]
     atom_idx = 0
@@ -1234,7 +1221,6 @@ def process_atom_features(
 
         # Map token to representative atom
         token_to_rep_atom.append(atom_idx + token["disto_idx"] - start)
-        token_to_center_atom.append(atom_idx + token["center_idx"] - start)
         if (chain["mol_type"] != const.chain_type_ids["NONPOLYMER"]) and token[
             "resolved_mask"
         ]:
@@ -1400,6 +1386,11 @@ def process_atom_features(
         # Only use a sampled structures to create distogram
         idx_list = ensemble_features["ensemble_ref_idxs"]
 
+    # Save a numpy array of the distogram to a path
+    # pdb_id = data.record.id
+    # with open(f"/afs/csail.mit.edu/u/m/mreveiz/rbg/temp_while_cp_rsg/temp/disto_outs_atlas10ns/{pdb_id}_disto_coords_ensemble.npy", "wb") as f:
+    #     np.save(f, disto_coords_ensemble)
+
     # Create distogram
     disto_target = torch.zeros(L, L, len(idx_list), num_bins)  # TODO1
 
@@ -1441,7 +1432,6 @@ def process_atom_features(
     atom_to_token = torch.tensor(atom_to_token, dtype=torch.long)
     token_to_rep_atom = torch.tensor(token_to_rep_atom, dtype=torch.long)
     r_set_to_rep_atom = torch.tensor(r_set_to_rep_atom, dtype=torch.long)
-    token_to_center_atom = torch.tensor(token_to_center_atom, dtype=torch.long)
     bfactor = from_numpy(atom_data["bfactor"].copy())
     plddt = from_numpy(atom_data["plddt"].copy())
     if override_bfactor:
@@ -1482,7 +1472,6 @@ def process_atom_features(
     atom_to_token = one_hot(atom_to_token, num_classes=token_id + 1)
     token_to_rep_atom = one_hot(token_to_rep_atom, num_classes=len(atom_data))
     r_set_to_rep_atom = one_hot(r_set_to_rep_atom, num_classes=len(atom_data))
-    token_to_center_atom = one_hot(token_to_center_atom, num_classes=len(atom_data))
 
     # Center the ground truth coordinates
     center = (coords * resolved_mask[None, :, None]).sum(dim=1)
@@ -1495,9 +1484,11 @@ def process_atom_features(
     # Apply random roto-translation to the input conformers
     for i in range(torch.max(ref_space_uid)):
         included = ref_space_uid == i
-        if torch.sum(included) > 0 and torch.any(resolved_mask[included]):
+        if torch.sum(included) > 0:
             ref_pos[included] = center_random_augmentation(
-                ref_pos[included][None], resolved_mask[included][None], centering=True
+                ref_pos[included][None],
+                torch.ones_like(resolved_mask[included][None]),
+                centering=True,
             )[0]
 
     # Compute padding and apply
@@ -1522,7 +1513,6 @@ def process_atom_features(
         coords = pad_dim(coords, 1, pad_len)
         atom_to_token = pad_dim(atom_to_token, 0, pad_len)
         token_to_rep_atom = pad_dim(token_to_rep_atom, 1, pad_len)
-        token_to_center_atom = pad_dim(token_to_center_atom, 1, pad_len)
         r_set_to_rep_atom = pad_dim(r_set_to_rep_atom, 1, pad_len)
         bfactor = pad_dim(bfactor, 0, pad_len)
         plddt = pad_dim(plddt, 0, pad_len)
@@ -1533,7 +1523,6 @@ def process_atom_features(
             atom_to_token = pad_dim(atom_to_token, 1, pad_len)
             token_to_rep_atom = pad_dim(token_to_rep_atom, 0, pad_len)
             r_set_to_rep_atom = pad_dim(r_set_to_rep_atom, 0, pad_len)
-            token_to_center_atom = pad_dim(token_to_center_atom, 0, pad_len)
             disto_target = pad_dim(pad_dim(disto_target, 0, pad_len), 1, pad_len)
             disto_coords_ensemble = pad_dim(disto_coords_ensemble, 1, pad_len)
 
@@ -1555,7 +1544,6 @@ def process_atom_features(
         "atom_to_token": atom_to_token,
         "token_to_rep_atom": token_to_rep_atom,
         "r_set_to_rep_atom": r_set_to_rep_atom,
-        "token_to_center_atom": token_to_center_atom,
         "disto_target": disto_target,
         "disto_coords_ensemble": disto_coords_ensemble,
         "bfactor": bfactor,
@@ -1570,20 +1558,19 @@ def process_atom_features(
 
 
 def process_msa_features(
-    data: Tokenized,
+    data: Input,
     random: np.random.Generator,
     max_seqs_batch: int,
     max_seqs: int,
     max_tokens: Optional[int] = None,
     pad_to_max_seqs: bool = False,
     msa_sampling: bool = False,
-    affinity: bool = False,
-) -> dict[str, Tensor]:
+) -> Dict[str, Tensor]:
     """Get the MSA features.
 
     Parameters
     ----------
-    data : Tokenized
+    data : Input
         The input to the model.
     random : np.random.Generator
         The random number generator.
@@ -1598,7 +1585,7 @@ def process_msa_features(
 
     Returns
     -------
-    dict[str, Tensor]
+    Dict[str, Tensor]
         The MSA features.
 
     """
@@ -1645,25 +1632,52 @@ def process_msa_features(
             deletion = pad_dim(deletion, 1, pad_len)
             profile = pad_dim(profile, 0, pad_len)
             deletion_mean = pad_dim(deletion_mean, 0, pad_len)
-    if affinity:
-        return {
-            "deletion_mean_affinity": deletion_mean,
-            "profile_affinity": profile,
-        }
-    else:
-        return {
-            "msa": msa,
-            "msa_paired": paired,
-            "deletion_value": deletion,
-            "has_deletion": has_deletion,
-            "deletion_mean": deletion_mean,
-            "profile": profile,
-            "msa_mask": msa_mask,
-        }
+
+    return {
+        "msa": msa,
+        "msa_paired": paired,
+        "deletion_value": deletion,
+        "has_deletion": has_deletion,
+        "deletion_mean": deletion_mean,
+        "profile": profile,
+        "msa_mask": msa_mask,
+    }
 
 
-def load_dummy_templates_features(tdim: int, num_tokens: int) -> dict:
-    """Load dummy templates for v2."""
+def process_template_features(
+    data: Input,
+    max_tokens: int,
+    max_templates: int,
+    pad_to_max_templates: bool,
+) -> Dict[str, Tensor]:
+    """Get the template features.
+
+    Parameters
+    ----------
+    data : Input
+        The input to the model.
+    max_tokens : int
+        The maximum number of tokens.
+    max_templates : int
+        The maximum number of templates.
+    pad_to_max_templates : bool
+        Whether to pad to the maximum number of templates.
+
+    Returns
+    -------
+    Dict[str, Tensor]
+        The template features.
+
+    """
+    # Get feature dimensions
+    tdim = (
+        max([1] + [len(v) for v in data.templates.values()])
+        if data.templates is not None
+        else 1
+    )
+    tdim = tdim if not pad_to_max_templates else max_templates
+    num_tokens = len(data.tokens) if max_tokens is None else max_tokens
+
     # Allocate features
     res_type = np.zeros((tdim, num_tokens), dtype=np.int64)
     frame_rot = np.zeros((tdim, num_tokens, 3, 3), dtype=np.float32)
@@ -1673,74 +1687,31 @@ def load_dummy_templates_features(tdim: int, num_tokens: int) -> dict:
     frame_mask = np.zeros((tdim, num_tokens), dtype=np.float32)
     cb_mask = np.zeros((tdim, num_tokens), dtype=np.float32)
     template_mask = np.zeros((tdim, num_tokens), dtype=np.float32)
-    query_to_template = np.zeros((tdim, num_tokens), dtype=np.int64)
-    visibility_ids = np.zeros((tdim, num_tokens), dtype=np.float32)
-
-    # Convert to one-hot
-    res_type = torch.from_numpy(res_type)
-    res_type = one_hot(res_type, num_classes=const.num_tokens)
-
-    return {
-        "template_restype": res_type,
-        "template_frame_rot": torch.from_numpy(frame_rot),
-        "template_frame_t": torch.from_numpy(frame_t),
-        "template_cb": torch.from_numpy(cb_coords),
-        "template_ca": torch.from_numpy(ca_coords),
-        "template_mask_cb": torch.from_numpy(cb_mask),
-        "template_mask_frame": torch.from_numpy(frame_mask),
-        "template_mask": torch.from_numpy(template_mask),
-        "query_to_template": torch.from_numpy(query_to_template),
-        "visibility_ids": torch.from_numpy(visibility_ids),
-    }
-
-
-def compute_template_features(
-    query_tokens: Tokenized,
-    tmpl_tokens: list[dict],
-    num_tokens: int,
-) -> dict:
-    """Compute the template features."""
-    # Allocate features
-    res_type = np.zeros((num_tokens,), dtype=np.int64)
-    frame_rot = np.zeros((num_tokens, 3, 3), dtype=np.float32)
-    frame_t = np.zeros((num_tokens, 3), dtype=np.float32)
-    cb_coords = np.zeros((num_tokens, 3), dtype=np.float32)
-    ca_coords = np.zeros((num_tokens, 3), dtype=np.float32)
-    frame_mask = np.zeros((num_tokens,), dtype=np.float32)
-    cb_mask = np.zeros((num_tokens,), dtype=np.float32)
-    template_mask = np.zeros((num_tokens,), dtype=np.float32)
-    query_to_template = np.zeros((num_tokens,), dtype=np.int64)
-    visibility_ids = np.zeros((num_tokens,), dtype=np.float32)
 
     # Now create features per token
-    asym_id_to_pdb_id = {}
+    if data.templates is not None:
+        for tok_idx, token in enumerate(data.tokens):
+            # Check if chain has templates
+            chain_id = int(token["asym_id"])
+            if chain_id not in data.templates:
+                continue
 
-    for token_dict in tmpl_tokens:
-        idx = token_dict["q_idx"]
-        pdb_id = token_dict["pdb_id"]
-        token = token_dict["token"]
-        query_token = query_tokens.tokens[idx]
-        asym_id_to_pdb_id[query_token["asym_id"]] = pdb_id
-        res_type[idx] = token["res_type"]
-        frame_rot[idx] = token["frame_rot"].reshape(3, 3)
-        frame_t[idx] = token["frame_t"]
-        cb_coords[idx] = token["disto_coords"]
-        ca_coords[idx] = token["center_coords"]
-        cb_mask[idx] = token["disto_mask"]
-        frame_mask[idx] = token["frame_mask"]
-        template_mask[idx] = 1.0
+            # Add per template features
+            for temp_idx, template in enumerate(data.templates[chain_id]):
+                t_data = template.coordinates
+                idx = np.where(t_data["res_idx"] == token["res_idx"])[0]
+                if len(idx) == 0:
+                    continue
 
-    # Set visibility_id for templated chains
-    for asym_id, pdb_id in asym_id_to_pdb_id.items():
-        indices = (query_tokens.tokens["asym_id"] == asym_id).nonzero()
-        visibility_ids[indices] = pdb_id
-
-    # Set visibility for non templated chain + olygomerics
-    for asym_id in np.unique(query_tokens.structure.chains["asym_id"]):
-        if asym_id not in asym_id_to_pdb_id:
-            # We hack the chain id to be negative to not overlap with the above
-            indices = (query_tokens.tokens["asym_id"] == asym_id).nonzero()
-            visibility_ids[indices] = -1 - asym_id
+                # Add template features
+                res_type[temp_idx, tok_idx] = t_data["res_type"][idx[0]]
+                frame_rot[temp_idx, tok_idx] = t_data["frame_rot"][idx[0]].reshape(3, 3)
+                frame_t[temp_idx, tok_idx] = t_data["frame_t"][idx[0]]
+                cb_coords[temp_idx, tok_idx] = t_data["coords_cb"][idx[0]]
+                ca_coords[temp_idx, tok_idx] = t_data["coords_ca"][idx[0]]
+                cb_mask[temp_idx, tok_idx] = t_data["mask_cb"][idx[0]]
+                frame_mask[temp_idx, tok_idx] = t_data["mask_frame"][idx[0]]
+                template_mask[temp_idx, tok_idx] = 1
 
     # Convert to one-hot
     res_type = torch.from_numpy(res_type)
@@ -1755,105 +1726,24 @@ def compute_template_features(
         "template_mask_cb": torch.from_numpy(cb_mask),
         "template_mask_frame": torch.from_numpy(frame_mask),
         "template_mask": torch.from_numpy(template_mask),
-        "query_to_template": torch.from_numpy(query_to_template),
-        "visibility_ids": torch.from_numpy(visibility_ids),
     }
 
 
-def process_template_features(
-    data: Tokenized,
-    max_tokens: int,
-) -> dict[str, torch.Tensor]:
-    """Load the given input data.
-
-    Parameters
-    ----------
-    data : Tokenized
-        The input to the model.
-    max_tokens : int
-        The maximum number of tokens.
-
-    Returns
-    -------
-    dict[str, torch.Tensor]
-        The loaded template features.
-
-    """
-    # Group templates by name
-    name_to_templates: dict[str, list[TemplateInfo]] = {}
-    for template_info in data.record.templates:
-        name_to_templates.setdefault(template_info.name, []).append(template_info)
-
-    # Map chain name to asym_id
-    chain_name_to_asym_id = {}
-    for chain in data.structure.chains:
-        chain_name_to_asym_id[chain["name"]] = chain["asym_id"]
-
-    # Compute the offset
-    template_features = []
-    for template_id, (template_name, templates) in enumerate(name_to_templates.items()):
-        row_tokens = []
-        template_structure = data.templates[template_name]
-        template_tokens = data.template_tokens[template_name]
-        tmpl_chain_name_to_asym_id = {}
-        for chain in template_structure.chains:
-            tmpl_chain_name_to_asym_id[chain["name"]] = chain["asym_id"]
-
-        for template in templates:
-            offset = template.template_st - template.query_st
-
-            # Get query and template tokens to map residues
-            query_tokens = data.tokens
-            chain_id = chain_name_to_asym_id[template.query_chain]
-            q_tokens = query_tokens[query_tokens["asym_id"] == chain_id]
-            q_indices = dict(zip(q_tokens["res_idx"], q_tokens["token_idx"]))
-
-            # Get the template tokens at the query residues
-            chain_id = tmpl_chain_name_to_asym_id[template.template_chain]
-            toks = template_tokens[template_tokens["asym_id"] == chain_id]
-            toks = [t for t in toks if t["res_idx"] - offset in q_indices]
-            for t in toks:
-                q_idx = q_indices[t["res_idx"] - offset]
-                row_tokens.append(
-                    {
-                        "token": t,
-                        "pdb_id": template_id,
-                        "q_idx": q_idx,
-                    }
-                )
-
-        # Compute template features for each row
-        row_features = compute_template_features(data, row_tokens, max_tokens)
-        row_features["template_force"] = torch.tensor(template.force)
-        row_features["template_force_threshold"] = torch.tensor(
-            template.threshold if template.threshold is not None else float("inf"),
-            dtype=torch.float32,
-        )
-        template_features.append(row_features)
-
-    # Stack each feature
-    out = {}
-    for k in template_features[0]:
-        out[k] = torch.stack([f[k] for f in template_features])
-    return out
-
-
-def process_symmetry_features(
-    cropped: Tokenized, symmetries: dict
-) -> dict[str, Tensor]:
+def process_symmetry_features(cropped: Input, symmetries: Dict) -> Dict[str, Tensor]:
     """Get the symmetry features.
 
     Parameters
     ----------
-    data : Tokenized
+    data : Input
         The input to the model.
 
     Returns
     -------
-    dict[str, Tensor]
+    Dict[str, Tensor]
         The symmetry features.
 
     """
+    # TODO this does not work with multiple conformers
     features = get_chain_symmetries(cropped)
     features.update(get_amino_acids_symmetries(cropped))
     features.update(get_ligand_symmetries(cropped, symmetries))
@@ -1862,17 +1752,17 @@ def process_symmetry_features(
 
 
 def process_ensemble_features(
-    data: Tokenized,
+    data: Input,
     random: np.random.Generator,
     num_ensembles: int,
     ensemble_sample_replacement: bool,
     fix_single_ensemble: bool,
-) -> dict[str, Tensor]:
+) -> Dict[str, Tensor]:
     """Get the ensemble features.
 
     Parameters
     ----------
-    data : Tokenized
+    data : Input
         The input to the model.
     random : np.random.Generator
         The random number generator.
@@ -1883,7 +1773,7 @@ def process_ensemble_features(
 
     Returns
     -------
-    dict[str, Tensor]
+    Dict[str, Tensor]
         The ensemble features.
 
     """
@@ -1921,251 +1811,14 @@ def process_ensemble_features(
     return ensemble_features
 
 
-def process_residue_constraint_features(data: Tokenized) -> dict[str, Tensor]:
-    residue_constraints = data.residue_constraints
-    if residue_constraints is not None:
-        rdkit_bounds_constraints = residue_constraints.rdkit_bounds_constraints
-        chiral_atom_constraints = residue_constraints.chiral_atom_constraints
-        stereo_bond_constraints = residue_constraints.stereo_bond_constraints
-        planar_bond_constraints = residue_constraints.planar_bond_constraints
-        planar_ring_5_constraints = residue_constraints.planar_ring_5_constraints
-        planar_ring_6_constraints = residue_constraints.planar_ring_6_constraints
-
-        rdkit_bounds_index = torch.tensor(
-            rdkit_bounds_constraints["atom_idxs"].copy(), dtype=torch.long
-        ).T
-        rdkit_bounds_bond_mask = torch.tensor(
-            rdkit_bounds_constraints["is_bond"].copy(), dtype=torch.bool
-        )
-        rdkit_bounds_angle_mask = torch.tensor(
-            rdkit_bounds_constraints["is_angle"].copy(), dtype=torch.bool
-        )
-        rdkit_upper_bounds = torch.tensor(
-            rdkit_bounds_constraints["upper_bound"].copy(), dtype=torch.float
-        )
-        rdkit_lower_bounds = torch.tensor(
-            rdkit_bounds_constraints["lower_bound"].copy(), dtype=torch.float
-        )
-
-        chiral_atom_index = torch.tensor(
-            chiral_atom_constraints["atom_idxs"].copy(), dtype=torch.long
-        ).T
-        chiral_reference_mask = torch.tensor(
-            chiral_atom_constraints["is_reference"].copy(), dtype=torch.bool
-        )
-        chiral_atom_orientations = torch.tensor(
-            chiral_atom_constraints["is_r"].copy(), dtype=torch.bool
-        )
-
-        stereo_bond_index = torch.tensor(
-            stereo_bond_constraints["atom_idxs"].copy(), dtype=torch.long
-        ).T
-        stereo_reference_mask = torch.tensor(
-            stereo_bond_constraints["is_reference"].copy(), dtype=torch.bool
-        )
-        stereo_bond_orientations = torch.tensor(
-            stereo_bond_constraints["is_e"].copy(), dtype=torch.bool
-        )
-
-        planar_bond_index = torch.tensor(
-            planar_bond_constraints["atom_idxs"].copy(), dtype=torch.long
-        ).T
-        planar_ring_5_index = torch.tensor(
-            planar_ring_5_constraints["atom_idxs"].copy(), dtype=torch.long
-        ).T
-        planar_ring_6_index = torch.tensor(
-            planar_ring_6_constraints["atom_idxs"].copy(), dtype=torch.long
-        ).T
-    else:
-        rdkit_bounds_index = torch.empty((2, 0), dtype=torch.long)
-        rdkit_bounds_bond_mask = torch.empty((0,), dtype=torch.bool)
-        rdkit_bounds_angle_mask = torch.empty((0,), dtype=torch.bool)
-        rdkit_upper_bounds = torch.empty((0,), dtype=torch.float)
-        rdkit_lower_bounds = torch.empty((0,), dtype=torch.float)
-        chiral_atom_index = torch.empty(
-            (
-                4,
-                0,
-            ),
-            dtype=torch.long,
-        )
-        chiral_reference_mask = torch.empty((0,), dtype=torch.bool)
-        chiral_atom_orientations = torch.empty((0,), dtype=torch.bool)
-        stereo_bond_index = torch.empty((4, 0), dtype=torch.long)
-        stereo_reference_mask = torch.empty((0,), dtype=torch.bool)
-        stereo_bond_orientations = torch.empty((0,), dtype=torch.bool)
-        planar_bond_index = torch.empty((6, 0), dtype=torch.long)
-        planar_ring_5_index = torch.empty((5, 0), dtype=torch.long)
-        planar_ring_6_index = torch.empty((6, 0), dtype=torch.long)
-
-    return {
-        "rdkit_bounds_index": rdkit_bounds_index,
-        "rdkit_bounds_bond_mask": rdkit_bounds_bond_mask,
-        "rdkit_bounds_angle_mask": rdkit_bounds_angle_mask,
-        "rdkit_upper_bounds": rdkit_upper_bounds,
-        "rdkit_lower_bounds": rdkit_lower_bounds,
-        "chiral_atom_index": chiral_atom_index,
-        "chiral_reference_mask": chiral_reference_mask,
-        "chiral_atom_orientations": chiral_atom_orientations,
-        "stereo_bond_index": stereo_bond_index,
-        "stereo_reference_mask": stereo_reference_mask,
-        "stereo_bond_orientations": stereo_bond_orientations,
-        "planar_bond_index": planar_bond_index,
-        "planar_ring_5_index": planar_ring_5_index,
-        "planar_ring_6_index": planar_ring_6_index,
-    }
-
-
-def process_chain_feature_constraints(data: Tokenized) -> dict[str, Tensor]:
-    structure = data.structure
-    if structure.bonds.shape[0] > 0:
-        connected_chain_index, connected_atom_index = [], []
-        for connection in structure.bonds:
-            if connection["chain_1"] == connection["chain_2"]:
-                continue
-            connected_chain_index.append([connection["chain_1"], connection["chain_2"]])
-            connected_atom_index.append([connection["atom_1"], connection["atom_2"]])
-        if len(connected_chain_index) > 0:
-            connected_chain_index = torch.tensor(
-                connected_chain_index, dtype=torch.long
-            ).T
-            connected_atom_index = torch.tensor(
-                connected_atom_index, dtype=torch.long
-            ).T
-        else:
-            connected_chain_index = torch.empty((2, 0), dtype=torch.long)
-            connected_atom_index = torch.empty((2, 0), dtype=torch.long)
-    else:
-        connected_chain_index = torch.empty((2, 0), dtype=torch.long)
-        connected_atom_index = torch.empty((2, 0), dtype=torch.long)
-
-    symmetric_chain_index = []
-    for i, chain_i in enumerate(structure.chains):
-        for j, chain_j in enumerate(structure.chains):
-            if j <= i:
-                continue
-            if chain_i["entity_id"] == chain_j["entity_id"]:
-                symmetric_chain_index.append([i, j])
-    if len(symmetric_chain_index) > 0:
-        symmetric_chain_index = torch.tensor(symmetric_chain_index, dtype=torch.long).T
-    else:
-        symmetric_chain_index = torch.empty((2, 0), dtype=torch.long)
-    return {
-        "connected_chain_index": connected_chain_index,
-        "connected_atom_index": connected_atom_index,
-        "symmetric_chain_index": symmetric_chain_index,
-    }
-
-
-def process_contact_feature_constraints(
-    data: Tokenized,
-    inference_pocket_constraints: list[tuple[int, list[tuple[int, int]], float]],
-    inference_contact_constraints: list[tuple[tuple[int, int], tuple[int, int], float]],
-):
-    token_data = data.tokens
-    union_idx = 0
-    pair_index, union_index, negation_mask, thresholds = [], [], [], []
-    for binder, contacts, max_distance, force in inference_pocket_constraints:
-        if not force:
-            continue
-
-        binder_chain = data.structure.chains[binder]
-        for token in token_data:
-            if (
-                token["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                and (token["asym_id"], token["res_idx"]) in contacts
-            ) or (
-                token["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                and (token["asym_id"], token["atom_idx"]) in contacts
-            ):
-                atom_idx_pairs = torch.cartesian_prod(
-                    torch.arange(
-                        binder_chain["atom_idx"],
-                        binder_chain["atom_idx"] + binder_chain["atom_num"],
-                    ),
-                    torch.arange(
-                        token["atom_idx"], token["atom_idx"] + token["atom_num"]
-                    ),
-                ).T
-                pair_index.append(atom_idx_pairs)
-                union_index.append(torch.full((atom_idx_pairs.shape[1],), union_idx))
-                negation_mask.append(
-                    torch.ones((atom_idx_pairs.shape[1],), dtype=torch.bool)
-                )
-                thresholds.append(torch.full((atom_idx_pairs.shape[1],), max_distance))
-                union_idx += 1
-
-    for token1, token2, max_distance, force in inference_contact_constraints:
-        if not force:
-            continue
-
-        for idx1, _token1 in enumerate(token_data):
-            if (
-                _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                and (_token1["asym_id"], _token1["res_idx"]) == token1
-            ) or (
-                _token1["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                and (_token1["asym_id"], _token1["atom_idx"]) == token1
-            ):
-                for idx2, _token2 in enumerate(token_data):
-                    if (
-                        _token2["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                        and (_token2["asym_id"], _token2["res_idx"]) == token2
-                    ) or (
-                        _token2["mol_type"] == const.chain_type_ids["NONPOLYMER"]
-                        and (_token2["asym_id"], _token2["atom_idx"]) == token2
-                    ):
-                        atom_idx_pairs = torch.cartesian_prod(
-                            torch.arange(
-                                _token1["atom_idx"],
-                                _token1["atom_idx"] + _token1["atom_num"],
-                            ),
-                            torch.arange(
-                                _token2["atom_idx"],
-                                _token2["atom_idx"] + _token2["atom_num"],
-                            ),
-                        ).T
-                        pair_index.append(atom_idx_pairs)
-                        union_index.append(
-                            torch.full((atom_idx_pairs.shape[1],), union_idx)
-                        )
-                        negation_mask.append(
-                            torch.ones((atom_idx_pairs.shape[1],), dtype=torch.bool)
-                        )
-                        thresholds.append(
-                            torch.full((atom_idx_pairs.shape[1],), max_distance)
-                        )
-                        union_idx += 1
-                        break
-                break
-
-    if len(pair_index) > 0:
-        pair_index = torch.cat(pair_index, dim=1)
-        union_index = torch.cat(union_index)
-        negation_mask = torch.cat(negation_mask)
-        thresholds = torch.cat(thresholds)
-    else:
-        pair_index = torch.empty((2, 0), dtype=torch.long)
-        union_index = torch.empty((0,), dtype=torch.long)
-        negation_mask = torch.empty((0,), dtype=torch.bool)
-        thresholds = torch.empty((0,), dtype=torch.float32)
-
-    return {
-        "contact_pair_index": pair_index,
-        "contact_union_index": union_index,
-        "contact_negation_mask": negation_mask,
-        "contact_thresholds": thresholds,
-    }
-
-
 class Boltz2Featurizer:
-    """Boltz2 featurizer."""
+    """Boltz2 featurizer for model training."""
 
     def process(
         self,
-        data: Tokenized,
+        data: Input,
         random: np.random.Generator,
-        molecules: dict[str, Mol],
+        molecules: Dict[str, Mol],
         training: bool,
         max_seqs: int,
         atoms_per_window_queries: int = 32,
@@ -2187,27 +1840,23 @@ class Boltz2Featurizer:
         binder_pocket_sampling_geometric_p: Optional[float] = 0.0,
         only_ligand_binder_pocket: Optional[bool] = False,
         only_pp_contact: Optional[bool] = False,
+        maximum_bond_distance: Optional[int] = 0,
         single_sequence_prop: Optional[float] = 0.0,
         msa_sampling: bool = False,
+        use_templates: bool = False,
+        max_templates: int = 4,
+        pad_to_max_templates: bool = False,
         override_bfactor: float = False,
         override_method: Optional[str] = None,
         compute_frames: bool = False,
         override_coords: Optional[Tensor] = None,
         bfactor_md_correction: bool = False,
-        compute_constraint_features: bool = False,
-        inference_pocket_constraints: Optional[
-            list[tuple[int, list[tuple[int, int]], float]]
-        ] = None,
-        inference_contact_constraints: Optional[
-            list[tuple[tuple[int, int], tuple[int, int], float]]
-        ] = None,
-        compute_affinity: bool = False,
-    ) -> dict[str, Tensor]:
+    ) -> Dict[str, Tensor]:
         """Compute features.
 
         Parameters
         ----------
-        data : Tokenized
+        data : Input
             The input to the model.
         training : bool
             Whether the model is in training mode.
@@ -2220,7 +1869,7 @@ class Boltz2Featurizer:
 
         Returns
         -------
-        dict[str, Tensor]
+        Dict[str, Tensor]
             The features for model training.
 
         """
@@ -2254,9 +1903,8 @@ class Boltz2Featurizer:
             binder_pocket_sampling_geometric_p=binder_pocket_sampling_geometric_p,
             only_ligand_binder_pocket=only_ligand_binder_pocket,
             only_pp_contact=only_pp_contact,
+            maximum_bond_distance=maximum_bond_distance,
             override_method=override_method,
-            inference_pocket_constraints=inference_pocket_constraints,
-            inference_contact_constraints=inference_contact_constraints,
         )
 
         # Compute atom features
@@ -2289,37 +1937,16 @@ class Boltz2Featurizer:
             msa_sampling=training and msa_sampling,
         )
 
-        # Compute MSA features
-        msa_features_affinity = {}
-        if compute_affinity:
-            msa_features_affinity = process_msa_features(
-                data=data,
-                random=random,
-                max_seqs_batch=1,
-                max_seqs=1,
-                max_tokens=max_tokens,
-                pad_to_max_seqs=pad_to_max_seqs,
-                msa_sampling=training and msa_sampling,
-                affinity=True,
-            )
-
-        # Compute affinity ligand Molecular Weight
-        ligand_to_mw = {}
-        if compute_affinity:
-            ligand_to_mw["affinity_mw"] = data.record.affinity.mw
-
         # Compute template features
-        num_tokens = data.tokens.shape[0] if max_tokens is None else max_tokens
-        if data.templates and not compute_affinity:
+        if use_templates:
             template_features = process_template_features(
                 data=data,
-                max_tokens=num_tokens,
+                max_tokens=max_tokens,
+                max_templates=max_templates,
+                pad_to_max_templates=pad_to_max_templates,
             )
         else:
-            template_features = load_dummy_templates_features(
-                tdim=1,
-                num_tokens=num_tokens,
-            )
+            template_features = {}
 
         # Compute symmetry features
         symmetry_features = {}
@@ -2327,33 +1954,11 @@ class Boltz2Featurizer:
             symmetries = get_symmetries(molecules)
             symmetry_features = process_symmetry_features(data, symmetries)
 
-        # Compute constraint features
-        residue_constraint_features = {}
-        chain_constraint_features = {}
-        contact_constraint_features = {}
-        if compute_constraint_features:
-            residue_constraint_features = process_residue_constraint_features(data)
-            chain_constraint_features = process_chain_feature_constraints(data)
-            contact_constraint_features = process_contact_feature_constraints(
-                data=data,
-                inference_pocket_constraints=inference_pocket_constraints
-                if inference_pocket_constraints
-                else [],
-                inference_contact_constraints=inference_contact_constraints
-                if inference_contact_constraints
-                else [],
-            )
-
         return {
             **token_features,
             **atom_features,
             **msa_features,
-            **msa_features_affinity,
             **template_features,
             **symmetry_features,
             **ensemble_features,
-            **residue_constraint_features,
-            **chain_constraint_features,
-            **contact_constraint_features,
-            **ligand_to_mw,
         }

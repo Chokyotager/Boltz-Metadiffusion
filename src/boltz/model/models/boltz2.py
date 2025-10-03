@@ -31,7 +31,6 @@ from boltz.model.modules.trunkv2 import (
     InputEmbedder,
     MSAModule,
     TemplateModule,
-    TemplateV2Module,
 )
 from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
@@ -102,7 +101,6 @@ class Boltz2(LightningModule):
         predict_bfactor: bool = False,
         log_loss_every_steps: int = 50,
         checkpoint_diffusion_conditioning: bool = False,
-        use_templates_v2: bool = False,
         use_kernels: bool = False,
     ) -> None:
         super().__init__()
@@ -153,6 +151,7 @@ class Boltz2(LightningModule):
         self.num_bins = num_bins
         self.min_dist = min_dist
         self.max_dist = max_dist
+        self.num_distograms = 1
         self.aggregate_distogram = aggregate_distogram
 
         # Trunk
@@ -216,10 +215,7 @@ class Boltz2(LightningModule):
         # Pairwise stack
         self.use_templates = use_templates
         if use_templates:
-            if use_templates_v2:
-                self.template_module = TemplateV2Module(token_z, **template_args)
-            else:
-                self.template_module = TemplateModule(token_z, **template_args)
+            self.template_module = TemplateModule(token_z, **template_args)
             if compile_templates:
                 self.is_template_compiled = True
                 self.template_module = torch.compile(
@@ -496,11 +492,7 @@ class Boltz2(LightningModule):
                 "z": z,
             }
 
-            if (
-                self.run_trunk_and_structure
-                and ((not self.training) or self.confidence_prediction)
-                and (not self.skip_run_structure)
-            ):
+            if self.run_trunk_and_structure and (not self.skip_run_structure):
                 if self.checkpoint_diffusion_conditioning and self.training:
                     # TODO decide whether this should be with bf16 or not
                     q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
@@ -530,19 +522,20 @@ class Boltz2(LightningModule):
                     "token_trans_bias": token_trans_bias,
                 }
 
-                with torch.autocast("cuda", enabled=False):
-                    struct_out = self.structure_module.sample(
-                        s_trunk=s.float(),
-                        s_inputs=s_inputs.float(),
-                        feats=feats,
-                        num_sampling_steps=num_sampling_steps,
-                        atom_mask=feats["atom_pad_mask"].float(),
-                        multiplicity=diffusion_samples,
-                        max_parallel_samples=max_parallel_samples,
-                        steering_args=self.steering_args,
-                        diffusion_conditioning=diffusion_conditioning,
-                    )
-                    dict_out.update(struct_out)
+                if (not self.training) or self.confidence_prediction:
+                    with torch.autocast("cuda", enabled=False):
+                        struct_out = self.structure_module.sample(
+                            s_trunk=s.float(),
+                            s_inputs=s_inputs.float(),
+                            feats=feats,
+                            num_sampling_steps=num_sampling_steps,
+                            atom_mask=feats["atom_pad_mask"].float(),
+                            multiplicity=diffusion_samples,
+                            max_parallel_samples=max_parallel_samples,
+                            steering_args=self.steering_args,
+                            diffusion_conditioning=diffusion_conditioning,
+                        )
+                        dict_out.update(struct_out)
 
                 if self.predict_bfactor:
                     pbfactor = self.bfactor_module(s)

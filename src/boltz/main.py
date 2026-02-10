@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import pickle
 import platform
+import shutil
 import tarfile
 import urllib.request
 import warnings
@@ -9,7 +10,7 @@ from dataclasses import asdict, dataclass
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import click
 import torch
@@ -27,7 +28,7 @@ from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.parse.a3m import parse_a3m
 from boltz.data.parse.csv import parse_csv
 from boltz.data.parse.fasta import parse_fasta
-from boltz.data.parse.yaml import parse_yaml
+from boltz.data.parse.yaml import parse_yaml, parse_yaml_with_metadiffusion
 from boltz.data.types import MSA, Manifest, Record
 from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
 from boltz.model.models.boltz1 import Boltz1
@@ -35,6 +36,8 @@ from boltz.model.models.boltz2 import Boltz2
 
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
 MOL_URL = "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar"
+# Legacy: MODEL_URL for backwards compatibility with tests
+MODEL_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1_conf.ckpt"
 
 BOLTZ1_URL_WITH_FALLBACK = [
     "https://model-gateway.boltz.bio/boltz1_conf.ckpt",
@@ -154,7 +157,524 @@ class BoltzSteeringParams:
     fk_resampling_interval: int = 3
     physical_guidance_update: bool = False
     contact_guidance_update: bool = True
-    num_gd_steps: int = 20
+    num_gd_steps: int = 1
+    # Guidance mode: "combine" (default), "post", or "pre"
+    # - combine: compute both pre and post gradients, add displacement vectors, apply to x_0
+    # - post: apply guidance to x_0 prediction after denoising only
+    # - pre: apply guidance to noisy coords before denoising only
+    guidance_mode: str = "combine"
+
+    # SAXS P(r) fitting parameters - multiple entries supported
+    # Each entry is a dict with: pr_file, loss_type, strength, etc.
+    saxs_pr_steering: bool = False  # Flag to enable SAXS output generation
+    saxs_configs: Optional[List[Dict[str, Any]]] = None  # List of SAXS config dicts
+    saxs_pr_data_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None  # Cached P(r) data by file
+
+    # Generic CV steering configs (from metadiffusion YAML steering section)
+    # Each entry has: collective_variable, target, strength, etc.
+    steering_configs: Optional[List[Dict[str, Any]]] = None
+
+    # Generic CV explore configs (from metadiffusion YAML explore section)
+    # Each entry has: collective_variable, type (hills/repulsion), strength, sigma, etc.
+    explore_configs: Optional[List[Dict[str, Any]]] = None
+
+    # Generic CV optimization configs (from metadiffusion YAML opt section)
+    # Each entry has: collective_variable, strength (sign determines minimize/maximize), etc.
+    opt_configs: Optional[List[Dict[str, Any]]] = None
+
+    # Chemical shift steering configs (from metadiffusion YAML chemical_shift section)
+    # Each entry has: ca_shifts, cb_shifts, strength, loss_type, etc.
+    chemical_shift_configs: Optional[List[Dict[str, Any]]] = None
+
+    # Denoising tempering: max per-atom displacement per denoising step (Å)
+    # Preserves relative magnitudes by uniform scaling across all atoms
+    # None = disabled (default), set to e.g. 0.5 to prevent phase transition/explosion
+    denoise_tempering: Optional[float] = None
+    # Total bias tempering: max per-atom displacement from ALL potentials combined (Å)
+    # Applied after individual per-potential bias_tempering limits
+    # None = disabled (default), set to e.g. 1.0 to limit total guidance displacement
+    total_bias_tempering: Optional[float] = None
+    # NOTE: bias_tempering is now per-potential (specified in each opt/steer/explore/saxs config)
+
+    # Noise scale for stochastic sampling (controls eps noise injection)
+    # None = use Boltz default (1.003 for Boltz2, 0.901 for Boltz1)
+    # Set to 0.0 for deterministic sampling
+    noise_scale: Optional[float] = None
+
+    # Debug mode: print debug information during potential creation
+    debug: bool = False
+
+    # Per-record steering: maps record_id -> full steering_args dict
+    # When records have different metadiffusion configs, each gets its own steering
+    per_record_steering: Optional[Dict[str, Any]] = None
+
+    # Metadynamics parameters (enhanced sampling with Gaussian hills)
+    metadynamics: bool = False
+    metadynamics_cv: str = "rg"  # CV type: "rg", "distance", "asphericity"
+    metadynamics_hill_height: float = 0.5  # Base Gaussian hill height
+    metadynamics_hill_sigma: float = 5.0  # Gaussian hill width in CV units
+    metadynamics_hill_interval: int = 5  # Steps between hill deposits
+    metadynamics_guidance_weight: float = 0.5  # Gradient descent weight
+    metadynamics_guidance_interval: int = 1  # Apply bias gradient every N steps
+    metadynamics_well_tempered: bool = False  # Use well-tempered metadynamics
+    metadynamics_bias_factor: float = 10.0  # Bias factor gamma for well-tempered
+    metadynamics_kT: float = 2.5  # Temperature kT for well-tempered
+    metadynamics_max_hills: int = 1000  # Maximum hills to store
+
+
+# Valid collective variable names for metadiffusion
+VALID_CVS = {
+    # Structural
+    "rg", "distance", "min_distance", "max_diameter", "asphericity",
+    # Angle/Dihedral
+    "angle", "dihedral", "angle_enhanced", "dihedral_enhanced",
+    # RMSD/Fluctuation
+    "rmsd", "pair_rmsd", "pair_rmsd_norm_rg", "pair_rmsd_grouped", "rmsf",
+    # Contacts
+    "native_contacts", "coordination", "hbond_count", "salt_bridges",
+    "contact_order", "local_contacts", "sasa",
+    # Secondary structure
+    "alpharmsd", "antibetarmsd", "parabetarmsd",
+    # Shape
+    "acylindricity", "shape_gyration",
+    # Content
+    "helix_content", "sheet_content",
+    # Other
+    "dipole_moment",
+    # DEPRECATED - kept for backward compatibility, will be removed
+    "distance_region", "angle_region", "dihedral_region",  # use distance/angle/dihedral with regions
+    "inter_chain", "inter_domain",  # use distance with region1/region2
+    "hinge_angle",  # use angle with region1/region2/region3
+}
+
+# Valid explore types
+VALID_EXPLORE_TYPES = {"hills", "repulsion", "variance"}
+VALID_BIAS_TYPES = VALID_EXPLORE_TYPES  # Backward compatibility alias
+
+
+def apply_metadiffusion_to_steering_args(
+    steering_args: BoltzSteeringParams,
+    metadiff_dict: dict,
+    base_path: Path,
+) -> None:
+    """Apply metadiffusion config from YAML to steering args.
+
+    All metadiffusion settings are configured exclusively via YAML.
+
+    Args:
+        steering_args: BoltzSteeringParams to update
+        metadiff_dict: Dict from metadiffusion JSON file
+        base_path: Base path for resolving relative file paths
+    """
+    # Apply SAXS configs (multiple entries supported)
+    saxs_list = metadiff_dict.get("saxs", [])
+    if saxs_list:
+        steering_args.saxs_configs = []
+        steering_args.saxs_pr_data_cache = {}
+
+        for saxs in saxs_list:
+            if "guidance_weight" in saxs:
+                raise ValueError(
+                    "The 'guidance_weight' parameter is deprecated. Use 'strength' instead."
+                )
+            pr_file = saxs.get("pr_file")
+            if not pr_file:
+                warnings.warn(
+                    "SAXS entry missing 'pr_file' field, skipping."
+                )
+                continue
+
+            # Resolve relative path
+            pr_path = Path(pr_file)
+            if not pr_path.is_absolute():
+                pr_path = base_path / pr_file
+
+            if pr_path.exists():
+                # Validate loss_type
+                loss_type = saxs.get("loss_type", "mse")
+                valid_loss_types = {"mse", "w2", "hybrid_w2_mse", "chi2", "rg", "w1", "mae", "kl", "cramer"}
+                if loss_type not in valid_loss_types:
+                    warnings.warn(
+                        f"Invalid SAXS loss_type '{loss_type}'. "
+                        f"Valid types: {sorted(valid_loss_types)}. Using 'mse'."
+                    )
+                    loss_type = "mse"
+
+                # Parse bins for uniform resampling
+                bins = saxs.get("bins")
+                if bins is not None:
+                    bins = int(bins)
+                    if bins < 2:
+                        warnings.warn(f"SAXS bins must be >= 2, got {bins}. Ignoring.")
+                        bins = None
+
+                # Parse bins_range
+                bins_range = saxs.get("bins_range")
+                if bins_range is not None:
+                    if isinstance(bins_range, (list, tuple)) and len(bins_range) == 2:
+                        bins_range = [float(bins_range[0]), float(bins_range[1])]
+                        if bins_range[0] >= bins_range[1]:
+                            warnings.warn(f"SAXS bins_range[0] must be < bins_range[1]. Ignoring.")
+                            bins_range = None
+                    else:
+                        warnings.warn(f"SAXS bins_range must be [r_min, r_max]. Ignoring.")
+                        bins_range = None
+
+                # Store config with resolved path
+                config = {
+                    "pr_file": str(pr_path),
+                    "loss_type": loss_type,
+                    "strength": float(saxs.get("strength", 1.0)),
+                    "guidance_interval": int(saxs.get("guidance_interval", 1)),
+                    "warmup": float(saxs.get("warmup", 0.0)),
+                    "cutoff": float(saxs.get("cutoff", 0.9)),
+                    "sigma_bin": float(saxs.get("sigma_bin", 0.5)),
+                    "units": saxs.get("units", "auto"),  # nm, angstrom, or auto
+                    "w2_epsilon": float(saxs.get("w2_epsilon", 0.1)),
+                    "w2_num_iter": int(saxs.get("w2_num_iter", 100)),
+                    "rg_scale": float(saxs.get("rg_scale", 1.0)),
+                    "use_rep_atoms": bool(saxs.get("use_rep_atoms", False)),
+                    "bins": bins,
+                    "bins_range": bins_range,
+                    "bias_clip": saxs.get("bias_clip"),
+                    "projection": saxs.get("projection"),
+                    "scaling": saxs.get("scaling"),
+                }
+                steering_args.saxs_configs.append(config)
+                # Enable SAXS output generation when at least one valid config exists
+                steering_args.saxs_pr_steering = True
+            else:
+                warnings.warn(
+                    f"SAXS PR file not found: {pr_path}. Skipping this SAXS entry."
+                )
+
+    # Apply steering configs - all CVs go through generic system
+    steering_list = metadiff_dict.get("steering", [])
+    for steer in steering_list:
+        if "guidance_weight" in steer:
+            raise ValueError(
+                "The 'guidance_weight' parameter is deprecated. Use 'strength' instead."
+            )
+        cv = steer.get("collective_variable", "")
+
+        # Validate CV name
+        if not cv:
+            warnings.warn(
+                "Steering entry missing 'collective_variable' field, skipping."
+            )
+            continue
+        if cv not in VALID_CVS:
+            warnings.warn(
+                f"Unknown collective_variable '{cv}' in steering. "
+                f"Valid CVs: {sorted(VALID_CVS)}. Skipping."
+            )
+            continue
+
+        # Handle target_from_saxs for Rg CV
+        target = steer.get("target")
+        target_from_saxs = steer.get("target_from_saxs")
+        auto_rg_scale = steer.get("auto_rg_scale", 1.0)
+
+        # Validate that target or target_from_saxs is provided
+        if target is None and target_from_saxs is None:
+            warnings.warn(
+                f"Steering on '{cv}' missing both 'target' and 'target_from_saxs'. "
+                "One must be provided. Skipping."
+            )
+            continue
+
+        # Validate target_from_saxs is only used with rg CV
+        if target_from_saxs is not None and cv != "rg":
+            warnings.warn(
+                f"'target_from_saxs' is only valid for collective_variable='rg', "
+                f"got '{cv}'. Ignoring target_from_saxs."
+            )
+            target_from_saxs = None
+
+        # Convert target to float if provided
+        if target is not None:
+            try:
+                target = float(target)
+            except (TypeError, ValueError):
+                warnings.warn(
+                    f"Invalid target value '{target}' for CV '{cv}'. "
+                    "Must be a number. Skipping."
+                )
+                continue
+
+        if target_from_saxs:
+            # Resolve path
+            saxs_path = Path(target_from_saxs)
+            if not saxs_path.is_absolute():
+                saxs_path = base_path / target_from_saxs
+            if saxs_path.exists():
+                target_from_saxs = str(saxs_path)
+            else:
+                warnings.warn(
+                    f"SAXS file for target_from_saxs not found: {saxs_path}. "
+                    "Ignoring target_from_saxs."
+                )
+                target_from_saxs = None
+
+        # Resolve reference structure path if provided
+        ref_struct = steer.get("reference_structure")
+        if ref_struct:
+            ref_path = Path(ref_struct)
+            if not ref_path.is_absolute():
+                ref_path = base_path / ref_struct
+            if ref_path.exists():
+                ref_struct = str(ref_path)
+            else:
+                warnings.warn(
+                    f"Reference structure not found: {ref_path}. "
+                    "Ignoring reference_structure."
+                )
+                ref_struct = None
+
+        # Add to generic steering configs
+        if steering_args.steering_configs is None:
+            steering_args.steering_configs = []
+
+        steering_args.steering_configs.append({
+            "collective_variable": cv,
+            "target": target,
+            "target_from_saxs": target_from_saxs,
+            "auto_rg_scale": auto_rg_scale,
+            "strength": float(steer.get("strength", 1.0)),
+            "guidance_interval": int(steer.get("guidance_interval", 1)),
+            "warmup": float(steer.get("warmup", 0.0)),
+            "cutoff": float(steer.get("cutoff", 0.75)),
+            "contact_cutoff": float(steer.get("contact_cutoff", 4.5)),
+            "ensemble": steer.get("ensemble", False),
+            "reference_structure": ref_struct,
+            "atom1": steer.get("atom1"),  # Raw string spec like "A:1:CA"
+            "atom2": steer.get("atom2"),
+            "atom3": steer.get("atom3"),
+            "atom4": steer.get("atom4"),
+            # Region specifications for angle/distance/dihedral CVs
+            "region1": steer.get("region1"),
+            "region2": steer.get("region2"),
+            "region3": steer.get("region3"),
+            "region4": steer.get("region4"),
+            "groups": steer.get("groups"),
+            "bias_clip": steer.get("bias_clip"),
+            # SASA CV specific
+            "probe_radius": float(steer.get("probe_radius", 1.4)),
+            "sasa_method": steer.get("sasa_method", "lcpo"),
+            "rmsd_groups": steer.get("rmsd_groups"),
+            "selection": steer.get("selection", "all"),
+        })
+
+    # Apply explore configs (hills/repulsion)
+    # Support both "explore" (new) and "biases" (deprecated) keys
+    explore_list = metadiff_dict.get("explore", [])
+    if not explore_list and "biases" in metadiff_dict:
+        warnings.warn(
+            "The 'biases' key in metadiffusion config is deprecated. Use 'explore' instead.",
+            DeprecationWarning
+        )
+        explore_list = metadiff_dict.get("biases", [])
+    for explore in explore_list:
+        if "guidance_weight" in explore:
+            raise ValueError(
+                "The 'guidance_weight' parameter is deprecated. Use 'strength' instead."
+            )
+        # JSON uses "type" key from YAML serialization
+        explore_type = explore.get("type", "") or explore.get("explore_type", "") or explore.get("bias_type", "")
+        cv = explore.get("collective_variable", "")
+
+        # Validate CV name
+        if not cv:
+            warnings.warn(
+                "Explore entry missing 'collective_variable' field, skipping."
+            )
+            continue
+        if cv not in VALID_CVS:
+            warnings.warn(
+                f"Unknown collective_variable '{cv}' in explore. "
+                f"Valid CVs: {sorted(VALID_CVS)}. Skipping."
+            )
+            continue
+
+        # Validate explore_type
+        if explore_type not in VALID_EXPLORE_TYPES:
+            warnings.warn(
+                f"Invalid or missing explore type '{explore_type}' for CV '{cv}'. "
+                f"Valid types: {sorted(VALID_EXPLORE_TYPES)}. Skipping."
+            )
+            continue
+
+        # Add to explore_configs list
+        if steering_args.explore_configs is None:
+            steering_args.explore_configs = []
+        steering_args.explore_configs.append({
+            "collective_variable": cv,
+            "type": explore_type,
+            "strength": explore.get("strength", 256.0),
+            "sigma": explore.get("sigma", 5.0),
+            "guidance_weight": 1.0,  # Deprecated - use strength instead
+            "guidance_interval": explore.get("guidance_interval", 1),
+            "warmup": explore.get("warmup", 0.0),
+            "cutoff": explore.get("cutoff", 0.75),
+            "hill_height": explore.get("hill_height", 0.5),
+            "hill_interval": explore.get("hill_interval", 5),
+            "well_tempered": explore.get("well_tempered", False),
+            "bias_factor": explore.get("bias_factor", 10.0),
+            "kT": explore.get("kT", 2.5),
+            "max_hills": explore.get("max_hills", 1000),
+            "contact_cutoff": explore.get("contact_cutoff", 4.5),
+            "reference_structure": explore.get("reference_structure"),
+            "bias_clip": explore.get("bias_clip"),
+            # Region specifications for angle/distance/dihedral CVs
+            "region1": explore.get("region1"),
+            "region2": explore.get("region2"),
+            "region3": explore.get("region3"),
+            "region4": explore.get("region4"),
+            "groups": explore.get("groups"),
+            "rmsd_groups": explore.get("rmsd_groups"),
+        })
+
+    # Apply opt configs (CV optimization - minimize or maximize)
+    opt_list = metadiff_dict.get("opt", [])
+#     print(f"DEBUG apply_metadiffusion: opt_list={opt_list}", flush=True)
+    for opt in opt_list:
+        if "guidance_weight" in opt:
+            raise ValueError(
+                "The 'guidance_weight' parameter is deprecated. Use 'strength' instead."
+            )
+        cv = opt.get("collective_variable", "")
+
+        # Validate CV name
+        if not cv:
+            warnings.warn(
+                "Opt entry missing 'collective_variable' field, skipping."
+            )
+            continue
+        if cv not in VALID_CVS:
+            warnings.warn(
+                f"Unknown collective_variable '{cv}' in opt. "
+                f"Valid CVs: {sorted(VALID_CVS)}. Skipping."
+            )
+            continue
+
+        # Add to opt_configs list
+        # Resolve reference structure path if provided
+        ref_struct = opt.get("reference_structure")
+        if ref_struct:
+            ref_path = Path(ref_struct)
+            if not ref_path.is_absolute():
+                ref_path = base_path / ref_struct
+            if ref_path.exists():
+                ref_struct = str(ref_path)
+            else:
+                warnings.warn(
+                    f"Reference structure not found: {ref_path}. "
+                    "Ignoring reference_structure."
+                )
+                ref_struct = None
+
+        if steering_args.opt_configs is None:
+            steering_args.opt_configs = []
+        steering_args.opt_configs.append({
+            "collective_variable": cv,
+            "strength": opt.get("strength", 1.0),
+            "guidance_interval": opt.get("guidance_interval", 1),
+            "warmup": opt.get("warmup", 0.0),
+            "cutoff": opt.get("cutoff", 0.75),
+            "log_gradient": opt.get("log_gradient", False),
+            "contact_cutoff": opt.get("contact_cutoff", 4.5),
+            "reference_structure": ref_struct,
+            # Region selection - prefer region1-4, fall back to atom1-4 for backward compat
+            "region1": opt.get("region1") or opt.get("atom1"),
+            "region2": opt.get("region2") or opt.get("atom2"),
+            "region3": opt.get("region3") or opt.get("atom3"),
+            "region4": opt.get("region4") or opt.get("atom4"),
+            "groups": opt.get("groups"),
+            "bias_clip": opt.get("bias_clip"),
+            # SASA CV specific
+            "probe_radius": float(opt.get("probe_radius", 1.4)),
+            "sasa_method": opt.get("sasa_method", "lcpo"),
+            # RMSD specific
+            "rmsd_groups": opt.get("rmsd_groups"),
+        })
+
+    # Apply chemical shift configs
+    chemical_shift_list = metadiff_dict.get("chemical_shift", [])
+    for cs in chemical_shift_list:
+        if "guidance_weight" in cs:
+            raise ValueError(
+                "The 'guidance_weight' parameter is deprecated. Use 'strength' instead."
+            )
+
+        # Resolve shift file paths
+        ca_shifts = cs.get("ca_shifts")
+        cb_shifts = cs.get("cb_shifts")
+
+        if ca_shifts:
+            ca_path = Path(ca_shifts)
+            if not ca_path.is_absolute():
+                ca_path = base_path / ca_shifts
+            if ca_path.exists():
+                ca_shifts = str(ca_path)
+            else:
+                warnings.warn(f"CA shifts file not found: {ca_path}. Skipping.")
+                ca_shifts = None
+
+        if cb_shifts:
+            cb_path = Path(cb_shifts)
+            if not cb_path.is_absolute():
+                cb_path = base_path / cb_shifts
+            if cb_path.exists():
+                cb_shifts = str(cb_path)
+            else:
+                warnings.warn(f"CB shifts file not found: {cb_path}. Skipping.")
+                cb_shifts = None
+
+        if not ca_shifts and not cb_shifts:
+            warnings.warn("Chemical shift config has no valid shift files. Skipping.")
+            continue
+
+        if steering_args.chemical_shift_configs is None:
+            steering_args.chemical_shift_configs = []
+
+        steering_args.chemical_shift_configs.append({
+            "ca_shifts": ca_shifts,
+            "cb_shifts": cb_shifts,
+            "strength": float(cs.get("strength", 1.0)),
+            "loss_type": cs.get("loss_type", "chi"),
+            "guidance_interval": int(cs.get("guidance_interval", 1)),
+            "warmup": float(cs.get("warmup", 0.0)),
+            "cutoff": float(cs.get("cutoff", 0.9)),
+            "bias_clip": cs.get("bias_clip"),
+        })
+
+    # Parse denoise_clip (top-level metadiffusion parameter)
+    if "denoise_clip" in metadiff_dict:
+        value = metadiff_dict["denoise_clip"]
+        steering_args.denoise_tempering = float(value) if value is not None else None
+
+    # Parse total_bias_clip (top-level limit on ALL potentials combined)
+    if "total_bias_clip" in metadiff_dict:
+        value = metadiff_dict["total_bias_clip"]
+        steering_args.total_bias_tempering = float(value) if value is not None else None
+
+    # Parse noise_scale (top-level YAML parameter)
+    if "noise_scale" in metadiff_dict:
+        value = metadiff_dict["noise_scale"]
+        steering_args.noise_scale = float(value) if value is not None else None
+
+    # Parse guidance_mode (top-level metadiffusion parameter)
+    # - "post" (default): apply guidance to x_0 prediction after denoising
+    # - "pre": apply guidance to noisy coords before denoising
+    # - "combine": compute both, add displacement vectors, apply to x_0
+    if "guidance_mode" in metadiff_dict:
+        steering_args.guidance_mode = str(metadiff_dict["guidance_mode"])
+    elif "guidance_before_denoising" in metadiff_dict:
+        # Backward compatibility
+        steering_args.guidance_mode = "pre" if bool(metadiff_dict["guidance_before_denoising"]) else "post"
+
+    # NOTE: bias_tempering is now per-potential (specified in each opt/steer/explore/saxs config)
+    # It's parsed into each config's dict and passed to potentials
 
 
 @rank_zero_only
@@ -545,10 +1065,11 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
 ) -> None:
     try:
         # Parse data
+        metadiffusion_config = None
         if path.suffix.lower() in (".fa", ".fas", ".fasta"):
             target = parse_fasta(path, ccd, mol_dir, boltz2)
         elif path.suffix.lower() in (".yml", ".yaml"):
-            target = parse_yaml(path, ccd, mol_dir, boltz2)
+            target, metadiffusion_config = parse_yaml_with_metadiffusion(path, ccd, mol_dir, boltz2)
         elif path.is_dir():
             msg = f"Found directory {path} instead of .fasta or .yaml, skipping."
             raise RuntimeError(msg)  # noqa: TRY301
@@ -654,6 +1175,16 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
         record_path = records_dir / f"{target.record.id}.json"
         target.record.dump(record_path)
 
+        # Dump metadiffusion config if present (in a separate subdirectory)
+        if metadiffusion_config is not None:
+            from boltz.data.parse.metadiffusion import metadiffusion_config_to_dict
+            import json
+            metadiff_dir = records_dir.parent / "metadiffusion"
+            metadiff_dir.mkdir(parents=True, exist_ok=True)
+            metadiff_path = metadiff_dir / f"{target.record.id}.json"
+            with metadiff_path.open("w") as f:
+                json.dump(metadiffusion_config_to_dict(metadiffusion_config), f, indent=2)
+
     except Exception as e:  # noqa: BLE001
         import traceback
 
@@ -725,7 +1256,21 @@ def process_inputs(
     records_dir = out_dir / "processed" / "records"
     if records_dir.exists():
         # Load existing records
-        existing = [Record.load(p) for p in records_dir.glob("*.json")]
+        # Filter out old-style metadiffusion configs (for backwards compatibility)
+        # A file is a metadiffusion config if:
+        # 1. Its stem ends with "_metadiffusion" AND
+        # 2. There exists a corresponding record file without the "_metadiffusion" suffix
+        def is_metadiff_config(p: Path) -> bool:
+            if not p.stem.endswith("_metadiffusion"):
+                return False
+            # Check if corresponding record exists
+            base_stem = p.stem[:-len("_metadiffusion")]
+            return (p.parent / f"{base_stem}.json").exists()
+
+        existing = [
+            Record.load(p) for p in records_dir.glob("*.json")
+            if not is_metadiff_config(p)
+        ]
         processed_ids = {record.id for record in existing}
 
         # Filter to missing only
@@ -803,9 +1348,25 @@ def process_inputs(
             process_input_partial(path)
 
     # Load all records and write manifest
-    records = [Record.load(p) for p in records_dir.glob("*.json")]
+    # Filter out old-style metadiffusion configs (for backwards compatibility)
+    # A file is a metadiffusion config if:
+    # 1. Its stem ends with "_metadiffusion" AND
+    # 2. There exists a corresponding record file without the "_metadiffusion" suffix
+    def is_metadiff_config(p: Path) -> bool:
+        if not p.stem.endswith("_metadiffusion"):
+            return False
+        # Check if corresponding record exists
+        base_stem = p.stem[:-len("_metadiffusion")]
+        return (p.parent / f"{base_stem}.json").exists()
+
+    record_files = [
+        p for p in records_dir.glob("*.json")
+        if not is_metadiff_config(p)
+    ]
+    records = [Record.load(p) for p in record_files]
     manifest = Manifest(records)
-    manifest.dump(out_dir / "processed" / "manifest.json")
+    manifest_path = out_dir / "processed" / "manifest.json"
+    manifest.dump(manifest_path)
 
 
 @click.group()
@@ -885,6 +1446,12 @@ def cli() -> None:
         "If not provided, the default step size will be used."
     ),
     default=None,
+)
+@click.option(
+    "--diffusion_progress_bar",
+    type=bool,
+    is_flag=True,
+    help="Show a progress bar during diffusion sampling steps. Default is False.",
 )
 @click.option(
     "--write_full_pae",
@@ -1039,6 +1606,11 @@ def cli() -> None:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="Enable debug output for YAML parsing and potential creation.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1054,6 +1626,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     diffusion_samples_affinity: int = 3,
     max_parallel_samples: Optional[int] = None,
     step_scale: Optional[float] = None,
+    diffusion_progress_bar: bool = False,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1077,6 +1650,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    debug: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1304,11 +1878,189 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "write_confidence_summary": True,
             "write_full_pae": write_full_pae,
             "write_full_pde": write_full_pde,
+            "diffusion_progress_bar": diffusion_progress_bar,
         }
 
         steering_args = BoltzSteeringParams()
         steering_args.fk_steering = use_potentials
         steering_args.physical_guidance_update = use_potentials
+        steering_args.debug = debug
+
+        # Load metadiffusion configs from YAML
+        # All metadiffusion settings are configured via YAML only
+        # This allows YAML-based steering without CLI flags
+        # When --override is set, re-parse from original YAML to pick up changes
+        metadiff_dir = out_dir / "processed" / "metadiffusion"
+        records_dir = out_dir / "processed" / "records"
+
+        # If override is set, re-parse metadiffusion from original YAML
+        if override and data:
+            from boltz.data.parse.yaml import parse_metadiffusion_from_yaml
+            from boltz.data.parse.metadiffusion import metadiffusion_config_to_dict
+            import json
+
+            per_record_metadiff = {}
+            base_path = Path(data[0]).parent if data else Path.cwd()
+            metadiff_dir.mkdir(parents=True, exist_ok=True)
+
+            for input_path in data:
+                input_path = Path(input_path)
+                if input_path.suffix.lower() not in (".yml", ".yaml"):
+                    continue
+                try:
+                    metadiffusion_config = parse_metadiffusion_from_yaml(input_path)
+                    if metadiffusion_config is not None:
+                        if debug:
+                            from boltz.data.parse.metadiffusion import debug_print_config
+                            debug_print_config(metadiffusion_config, enabled=True)
+                        metadiff_dict = metadiffusion_config_to_dict(metadiffusion_config)
+                        # Record ID is the file stem (e.g. rg1.yaml -> rg1)
+                        record_id = input_path.stem
+                        per_record_metadiff[record_id] = metadiff_dict
+                        # Update cached JSON so future runs without --override use new config
+                        cache_path = metadiff_dir / f"{record_id}.json"
+                        with cache_path.open("w") as f:
+                            json.dump(metadiff_dict, f, indent=2)
+                except Exception as e:
+                    click.echo(f"Warning: Could not re-parse metadiffusion from {input_path}: {e}")
+
+            if per_record_metadiff:
+                # Apply first record's config as base (sets boolean flags for sampling)
+                first_dict = next(iter(per_record_metadiff.values()))
+                apply_metadiffusion_to_steering_args(
+                    steering_args, first_dict, base_path=base_path,
+                )
+
+                # Check if configs differ between records
+                configs_list = list(per_record_metadiff.values())
+                all_identical = len(configs_list) <= 1 or all(
+                    c == configs_list[0] for c in configs_list[1:]
+                )
+
+                if not all_identical:
+                    per_record_steering = {}
+                    for record_id, md_dict in per_record_metadiff.items():
+                        rec_steering = BoltzSteeringParams()
+                        rec_steering.fk_steering = use_potentials
+                        rec_steering.physical_guidance_update = use_potentials
+                        rec_steering.debug = debug
+                        apply_metadiffusion_to_steering_args(
+                            rec_steering, md_dict, base_path=base_path,
+                        )
+                        per_record_steering[record_id] = asdict(rec_steering)
+                    steering_args.per_record_steering = per_record_steering
+        else:
+            # Load per-record metadiffusion configs from cached JSON
+            per_record_metadiff = {}
+            base_path = Path(data[0]).parent if data else Path.cwd()
+
+            for record in manifest.records:
+                # Try new location first
+                metadiff_path = metadiff_dir / f"{record.id}.json"
+                # Fall back to old location for backwards compatibility
+                if not metadiff_path.exists():
+                    metadiff_path = records_dir / f"{record.id}_metadiffusion.json"
+                if metadiff_path.exists():
+                    import json
+                    with metadiff_path.open("r") as f:
+                        metadiff_dict = json.load(f)
+                    # Print debug info if enabled
+                    if debug:
+                        print(f"[DEBUG] Loaded metadiffusion config for {record.id}: {metadiff_path}")
+                        print(f"[DEBUG] Config keys: {list(metadiff_dict.keys())}")
+                        if metadiff_dict.get("steering"):
+                            print(f"[DEBUG] Steering configs: {len(metadiff_dict.get('steering', []))}")
+                        if metadiff_dict.get("explore"):
+                            print(f"[DEBUG] Explore configs: {len(metadiff_dict.get('explore', []))}")
+                    per_record_metadiff[record.id] = metadiff_dict
+
+            if per_record_metadiff:
+                # Apply first record's config as base (sets boolean flags for sampling)
+                first_dict = next(iter(per_record_metadiff.values()))
+                apply_metadiffusion_to_steering_args(
+                    steering_args, first_dict, base_path=base_path,
+                )
+
+                # Check if configs differ between records
+                configs_list = list(per_record_metadiff.values())
+                all_identical = len(configs_list) <= 1 or all(
+                    c == configs_list[0] for c in configs_list[1:]
+                )
+
+                if not all_identical:
+                    # Build per-record steering dicts for records with different configs
+                    per_record_steering = {}
+                    for record_id, md_dict in per_record_metadiff.items():
+                        rec_steering = BoltzSteeringParams()
+                        rec_steering.fk_steering = use_potentials
+                        rec_steering.physical_guidance_update = use_potentials
+                        rec_steering.debug = debug
+                        apply_metadiffusion_to_steering_args(
+                            rec_steering, md_dict, base_path=base_path,
+                        )
+                        per_record_steering[record_id] = asdict(rec_steering)
+                    steering_args.per_record_steering = per_record_steering
+
+        # Load experimental P(r) data for SAXS configs and steering with target_from_saxs
+        # Collect from base steering_args AND all per-record steering dicts
+        all_saxs_configs = list(steering_args.saxs_configs or [])
+        all_steering_configs = list(steering_args.steering_configs or [])
+        if steering_args.per_record_steering:
+            for rec_dict in steering_args.per_record_steering.values():
+                all_saxs_configs.extend(rec_dict.get("saxs_configs") or [])
+                all_steering_configs.extend(rec_dict.get("steering_configs") or [])
+
+        # Collect all unique P(r) files to load with their settings
+        # First config's settings win for each file
+        pr_files_to_load = {}  # file -> {units, bins, bins_range}
+        for config in all_saxs_configs:
+            pr_file = config.get("pr_file")
+            if pr_file and pr_file not in pr_files_to_load:
+                pr_files_to_load[pr_file] = {
+                    "units": config.get("units", "auto"),
+                    "bins": config.get("bins"),
+                    "bins_range": config.get("bins_range"),
+                }
+
+        # Also check for target_from_saxs in steering_configs (for Rg steering from SAXS)
+        for config in all_steering_configs:
+            saxs_file = config.get("target_from_saxs")
+            if saxs_file and saxs_file not in pr_files_to_load:
+                # Steering configs don't have bins settings, use defaults
+                pr_files_to_load[saxs_file] = {
+                    "units": "auto",
+                    "bins": None,
+                    "bins_range": None,
+                }
+
+        # Load all unique P(r) files
+        if pr_files_to_load:
+            from boltz.data.saxs import load_experimental_pr
+            steering_args.saxs_pr_data_cache = {}
+
+            for pr_file, settings in pr_files_to_load.items():
+                pr_path = Path(pr_file)
+                if pr_path.exists():
+                    r_grid, pr_exp, pr_errors = load_experimental_pr(
+                        pr_path,
+                        normalize=True,
+                        device=None,
+                        units=settings["units"],
+                        bins=settings["bins"],
+                        bins_range=tuple(settings["bins_range"]) if settings["bins_range"] else None,
+                    )
+                    steering_args.saxs_pr_data_cache[pr_file] = {
+                        'r_grid': r_grid,
+                        'pr_exp': pr_exp,
+                        'pr_errors': pr_errors
+                    }
+                    bins_info = f", resampled to {settings['bins']} bins" if settings["bins"] else ""
+                    print(f"Loaded SAXS P(r) from: {pr_file}{bins_info}")
+
+        # Propagate shared resources (e.g. SAXS data cache) to per-record steering dicts
+        if steering_args.per_record_steering:
+            for rec_dict in steering_args.per_record_steering.values():
+                rec_dict["saxs_pr_data_cache"] = steering_args.saxs_pr_data_cache
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
         model_module = model_cls.load_from_checkpoint(

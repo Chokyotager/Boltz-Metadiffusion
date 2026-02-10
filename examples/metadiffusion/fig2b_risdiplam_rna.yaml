@@ -1,0 +1,24 @@
+version: 1
+
+sequences:
+  - rna:
+      id: [A]
+      sequence: AUACUUACCUG
+
+  - rna:
+      id: [B]
+      sequence: GGAGUAAGUCU
+
+  - ligand:
+      id: C
+      smiles: CC1=CC(=NN2C1=NC(=C2)C)C3=CC(=O)N4C=C(C=CC4=N3)N5CCNC6(C5)CC6
+
+metadiffusion:
+
+  - total_bias_clip: 3.0
+
+  - opt:
+      collective_variable: pair_rmsd
+      strength: 3.0
+      warmup: 0.1
+      cutoff: 0.8

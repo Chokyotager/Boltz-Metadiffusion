@@ -1,0 +1,29 @@
+version: 1
+
+sequences:
+  - protein:
+      id: A
+      sequence: MTEYKLVVVGAGGVGKSALTIQLIQNHFVDEYDPTIEDSYRKQVVIDGETCLLDILDTAGQEEYSAMRDQYMRTGEGFLCVFAINNTKSFEDIHQYREQIKRVKDSDDVPMVLVGNKCDLAARTVESRQAQDLARSYGIPYIETSAKTRQGVEDAFYTLVREIRQH
+
+  - protein:
+      id: B
+      sequence: TSNTIRVFLPNKQRTVVNVRNGMSLHDCLMKALKVRGLQPECCAVFRLLHEHKGKKARLDWNTDAASLIGEELQVDFL
+
+  - ligand:
+      id: C
+      smiles: O=P(O)(O)NP(=O)(O)OP(=O)(O)OCC3OC(n2cnc1c2N=C(N)NC1=O)C(O)C3O
+
+# Top-level sampling parameters for stable metadiffusion
+
+metadiffusion:
+
+  - total_bias_clip: 2.5
+
+  # Maximize diversity using pair_rmsd
+  - opt:
+      collective_variable: pair_rmsd_grouped
+      groups: [B]
+      rmsd_groups: [A]
+      strength: 2.5
+      warmup: 0.1
+      cutoff: 0.75

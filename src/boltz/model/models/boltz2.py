@@ -407,6 +407,7 @@ class Boltz2(LightningModule):
         diffusion_samples: int = 1,
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
+        diffusion_progress_bar: bool = False,
     ) -> dict[str, Tensor]:
         with torch.set_grad_enabled(
             self.training and self.structure_prediction_training
@@ -540,6 +541,7 @@ class Boltz2(LightningModule):
                         max_parallel_samples=max_parallel_samples,
                         steering_args=self.steering_args,
                         diffusion_conditioning=diffusion_conditioning,
+                        show_progress=diffusion_progress_bar,
                     )
                     dict_out.update(struct_out)
 
@@ -583,6 +585,12 @@ class Boltz2(LightningModule):
                 assert len(feats["coords"].shape) == 3
 
         if self.confidence_prediction:
+            # Free GPU memory before confidence prediction to avoid OOM
+            # This is especially important with large diffusion_samples
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
             dict_out.update(
                 self.confidence_module(
                     s_inputs=s_inputs.detach(),
@@ -1055,6 +1063,17 @@ class Boltz2(LightningModule):
                 validator.on_epoch_end(model=self)
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> dict:
+        # Apply per-record steering config if records have different metadiffusion configs
+        original_steering_args = None
+        per_record = self.steering_args.get("per_record_steering") if self.steering_args else None
+        if per_record:
+            records = batch.get("record", [])
+            if records:
+                record_id = records[0].id
+                if record_id in per_record:
+                    original_steering_args = self.steering_args
+                    self.steering_args = per_record[record_id]
+
         try:
             out = self(
                 batch,
@@ -1063,6 +1082,7 @@ class Boltz2(LightningModule):
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 max_parallel_samples=self.predict_args["max_parallel_samples"],
                 run_confidence_sequentially=True,
+                diffusion_progress_bar=self.predict_args.get("diffusion_progress_bar", False),
             )
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
@@ -1118,6 +1138,23 @@ class Boltz2(LightningModule):
                     pred_dict["affinity_probability_binary2"] = out[
                         "affinity_probability_binary2"
                     ]
+
+            # Add SAXS P(r) results if present
+            if "saxs_pr_results" in out:
+                pred_dict["saxs_pr_results"] = out["saxs_pr_results"]
+
+            # Add chemical shift results if present
+            if "cheshift_results" in out:
+                pred_dict["cheshift_results"] = out["cheshift_results"]
+
+            # Add bias histories if present (metadynamics hills, repulsion energies)
+            if "bias_histories" in out:
+                pred_dict["bias_histories"] = out["bias_histories"]
+
+            # Add comprehensive CV histories if present (all potentials' CV values per step)
+            if "cv_histories" in out:
+                pred_dict["cv_histories"] = out["cv_histories"]
+
             return pred_dict
 
         except RuntimeError as e:  # catch out of memory exceptions
@@ -1128,6 +1165,9 @@ class Boltz2(LightningModule):
                 return {"exception": True}
             else:
                 raise e
+        finally:
+            if original_steering_args is not None:
+                self.steering_args = original_steering_args
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure the optimizer."""

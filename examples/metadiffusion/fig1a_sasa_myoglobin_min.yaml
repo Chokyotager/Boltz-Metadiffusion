@@ -1,0 +1,16 @@
+version: 1
+
+sequences:
+  - protein:
+      id: A
+      sequence: VLSEGEWQLVLHVWAKVEADVAGHGQDILIRLFKSHPETLEKFDRFKHLKTEAEMKASEDLKKHGVTVLTALGAILKKKGHHEAELKPLAQSHATKHKIPIKYLEFISEAIIHVLHSRHPGDFGADAQGAMNKALELFRKDIAAKYKELGYQG
+
+metadiffusion:
+
+  - total_bias_clip: 5.0
+
+  - opt:
+      collective_variable: sasa
+      strength: -5.0
+      warmup: 0.1
+      cutoff: 0.8

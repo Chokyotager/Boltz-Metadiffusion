@@ -1,0 +1,30 @@
+version: 1
+
+sequences:
+  - protein:
+      id: A
+      sequence: MADQLTEEQIAEFKEAFSLFDKDGDGTITTKELGTVMRSLGQNPTEAELQDMINEVDADGNGTIDFPEFLTMMARKMKDTDSEEEIREAFRVFDKDGNGYISAAELRHVMTNLGEKLTDEEVDEMIREADIDGDGQVNYEEFVQMMTAK
+
+metadiffusion:
+  - saxs:
+      pr_file: SASDJ64.out
+      loss_type: cramer
+      strength: 32.0
+      bins: 32
+      warmup: 0.0
+      cutoff: 0.8
+
+  - chemical_shift:
+      ca_shifts: bmr51289_3_ca.dat
+      cb_shifts: bmr51289_3_cb.dat
+      strength: 4.0
+      loss_type: ccc
+      warmup: 0.0
+      cutoff: 0.8
+      auto_offset: false
+
+  - opt:
+      collective_variable: pair_rmsd
+      strength: 0.5
+      warmup: 0.0
+      cutoff: 0.8

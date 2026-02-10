@@ -1,0 +1,23 @@
+version: 1
+
+sequences:
+  - rna:
+      id: A
+      sequence: GGGCGCAUUUUGGUAGGUCGGUCGCUGCUUCGGCAGUGAGGGGUAGGCAUUGCUGGCCUAGGGUGCCC
+  - ligand:
+      id: B
+      smiles: C1=NC2=C(N1[C@H]3[C@@H]([C@@H]([C@H](O3)COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N=C(NC2=O)N
+
+metadiffusion:
+  - total_bias_clip: 4.0
+  - saxs:
+      pr_file: SASDWJ4.out
+      loss_type: cramer
+      strength: 8.0
+      bins: 32
+      guidance_interval: 1
+      cutoff: 0.8
+  - opt:
+      collective_variable: pair_rmsd
+      strength: 1.0
+      cutoff: 0.8

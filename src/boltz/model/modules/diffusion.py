@@ -5,6 +5,7 @@ from __future__ import annotations
 from math import sqrt
 
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
@@ -35,6 +36,7 @@ from boltz.model.modules.utils import (
     default,
     log,
 )
+from boltz.model.potentials import potentials as potentials_module
 from boltz.model.potentials.potentials import get_potentials
 
 
@@ -454,12 +456,17 @@ class AtomDiffusion(Module):
         max_parallel_samples=None,
         train_accumulate_token_repr=False,
         steering_args=None,
+        show_progress=False,
         **network_condition_kwargs,
     ):
         if steering_args is not None and (
             steering_args["fk_steering"] or steering_args["physical_guidance_update"]
         ):
-            potentials = get_potentials(steering_args, boltz2=False)
+            potentials = get_potentials(
+                steering_args, boltz2=False,
+                feats=network_condition_kwargs.get("feats"),
+                debug=steering_args.get("debug", False),
+            )
         if steering_args is not None and steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
             energy_traj = torch.empty((multiplicity, 0), device=self.device)
@@ -498,7 +505,15 @@ class AtomDiffusion(Module):
         token_a = None
 
         # gradually denoise
-        for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+        step_iterator = enumerate(sigmas_and_gammas)
+        if show_progress:
+            step_iterator = tqdm(
+                step_iterator,
+                total=len(sigmas_and_gammas),
+                desc="Diffusion",
+                leave=False,
+            )
+        for step_idx, (sigma_tm, sigma_t, gamma) in step_iterator:
             random_R, random_tr = compute_random_augmentation(
                 multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
             )
@@ -525,18 +540,88 @@ class AtomDiffusion(Module):
 
             t_hat = sigma_tm * (1 + gamma)
             steering_t = 1.0 - (step_idx / num_sampling_steps)
-            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
+
+            # Use noise_scale from YAML if provided, otherwise use Boltz default
+            # Set to 0.0 for deterministic sampling
+            effective_noise_scale = self.noise_scale  # Boltz default (0.901 for Boltz1)
+            if steering_args and steering_args.get("noise_scale") is not None:
+                effective_noise_scale = steering_args["noise_scale"]
+            noise_var = effective_noise_scale**2 * (t_hat**2 - sigma_tm**2)
             eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
             atom_coords_noisy = atom_coords + eps
+
+            # === PRE-DENOISING GUIDANCE (experimental) ===
+            # If guidance_before_denoising=True, apply guidance to noisy coords before model
+            guidance_before_denoising = steering_args.get("guidance_before_denoising", False) if steering_args else False
+
+            if guidance_before_denoising and steering_args is not None and (
+                steering_args["physical_guidance_update"]
+            ) and step_idx < num_sampling_steps - 1:
+                # Compute guidance on noisy coordinates
+                pre_guidance_update = torch.zeros_like(atom_coords_noisy)
+                min_bias_tempering = None  # Track minimum across all potentials
+
+                for guidance_step in range(steering_args["num_gd_steps"]):
+                    potentials_module.SAXSPrPotential.clear_cache(step_idx * 1000 + guidance_step)
+
+                    energy_gradient = torch.zeros_like(atom_coords_noisy)
+                    for potential in potentials:
+                        parameters = potential.compute_parameters(steering_t)
+                        parameters['_step_idx'] = step_idx
+                        parameters['_relaxation'] = steering_t  # For warmup/cutoff
+                        if (
+                            parameters["guidance_weight"] > 0
+                            and (guidance_step) % parameters["guidance_interval"] == 0
+                        ):
+                            pot_gradient = parameters["guidance_weight"] * potential.compute_gradient(
+                                atom_coords_noisy + pre_guidance_update,
+                                network_condition_kwargs["feats"],
+                                parameters,
+                            )
+
+                            # Track minimum bias_tempering across potentials
+                            pot_bias_tempering = parameters.get("bias_tempering")
+                            if pot_bias_tempering is not None:
+                                if min_bias_tempering is None:
+                                    min_bias_tempering = pot_bias_tempering
+                                else:
+                                    min_bias_tempering = min(min_bias_tempering, pot_bias_tempering)
+
+                            energy_gradient += pot_gradient
+                    pre_guidance_update -= energy_gradient
+
+                # Apply bias tempering to total guidance_update (max atom movement per diffusion step)
+                if min_bias_tempering is not None:
+                    sigma_scale_bias = max(1.0, sigma_t / 100.0)
+                    effective_bias_limit = min_bias_tempering * sigma_scale_bias
+                    guidance_norms = pre_guidance_update.norm(dim=-1)
+                    max_norms = guidance_norms.max(dim=-1, keepdim=True).values
+                    scale = torch.where(
+                        max_norms > effective_bias_limit,
+                        effective_bias_limit / max_norms.clamp(min=1e-8),
+                        torch.ones_like(max_norms)
+                    )
+                    pre_guidance_update = pre_guidance_update * scale.unsqueeze(-1)
+
+                # Apply guidance to noisy coords BEFORE denoising
+                atom_coords_noisy = atom_coords_noisy + pre_guidance_update
+
+                # Track for scaled_guidance_update (used in FK resampling)
+                scaled_guidance_update = (
+                    pre_guidance_update
+                    * -1
+                    * self.step_scale
+                    * (sigma_t - t_hat)
+                    / t_hat
+                )
 
             with torch.no_grad():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
                 token_a = torch.zeros(token_repr_shape).to(atom_coords_noisy)
 
                 sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    multiplicity % max_parallel_samples + 1
-                )
+                num_chunks = (multiplicity + max_parallel_samples - 1) // max_parallel_samples
+                sample_ids_chunks = sample_ids.chunk(num_chunks)
                 for sample_ids_chunk in sample_ids_chunks:
                     atom_coords_denoised_chunk, token_a_chunk = (
                         self.preconditioned_network_forward(
@@ -599,14 +684,22 @@ class AtomDiffusion(Module):
                         dim=1,
                     )
 
-                # Compute guidance update to x_0 prediction
+                # Compute guidance update to x_0 prediction (post-denoising, default mode)
+                # Skip if guidance_before_denoising=True (already applied before model)
                 if (
                     steering_args is not None
+                    and not guidance_before_denoising
                     and steering_args["physical_guidance_update"]
                     and step_idx < num_sampling_steps - 1
                 ):
                     guidance_update = torch.zeros_like(atom_coords_denoised)
+                    min_bias_tempering = None  # Track minimum across all potentials
+
                     for guidance_step in range(steering_args["num_gd_steps"]):
+                        # Clear SAXS P(r) cache at start of each guidance step
+                        # Use composite key: step_idx * 1000 + guidance_step to uniquely identify
+                        potentials_module.SAXSPrPotential.clear_cache(step_idx * 1000 + guidance_step)
+
                         energy_gradient = torch.zeros_like(atom_coords_denoised)
                         for potential in potentials:
                             parameters = potential.compute_parameters(steering_t)
@@ -615,14 +708,39 @@ class AtomDiffusion(Module):
                                 and (guidance_step) % parameters["guidance_interval"]
                                 == 0
                             ):
-                                energy_gradient += parameters[
+                                # Compute this potential's gradient
+                                pot_gradient = parameters[
                                     "guidance_weight"
                                 ] * potential.compute_gradient(
                                     atom_coords_denoised + guidance_update,
                                     network_condition_kwargs["feats"],
                                     parameters,
                                 )
+
+                                # Track minimum bias_tempering across potentials
+                                pot_bias_tempering = parameters.get("bias_tempering")
+                                if pot_bias_tempering is not None:
+                                    if min_bias_tempering is None:
+                                        min_bias_tempering = pot_bias_tempering
+                                    else:
+                                        min_bias_tempering = min(min_bias_tempering, pot_bias_tempering)
+
+                                energy_gradient += pot_gradient
                         guidance_update -= energy_gradient
+
+                    # Apply bias tempering to total guidance_update (max atom movement per diffusion step)
+                    if min_bias_tempering is not None:
+                        sigma_scale_bias = max(1.0, sigma_t / 100.0)
+                        effective_bias_limit = min_bias_tempering * sigma_scale_bias
+                        guidance_norms = guidance_update.norm(dim=-1)
+                        max_norms = guidance_norms.max(dim=-1, keepdim=True).values
+                        scale = torch.where(
+                            max_norms > effective_bias_limit,
+                            effective_bias_limit / max_norms.clamp(min=1e-8),
+                            torch.ones_like(max_norms)
+                        )
+                        guidance_update = guidance_update * scale.unsqueeze(-1)
+
                     atom_coords_denoised += guidance_update
                     scaled_guidance_update = (
                         guidance_update
@@ -698,11 +816,33 @@ class AtomDiffusion(Module):
                 atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
 
             denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
-            atom_coords_next = (
-                atom_coords_noisy
-                + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
-            )
+            update = self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
 
+            # Apply denoising tempering if configured
+            # Limits max per-atom displacement while preserving relative magnitudes
+            # IMPORTANT: Tempering is sigma-aware - at high sigma (early steps), large updates are
+            # normal and necessary. Only apply strict tempering in the low-sigma regime.
+            denoise_tempering = steering_args.get("denoise_tempering", None) if steering_args else None
+            if denoise_tempering is not None:
+                # Scale the tempering threshold by sigma_t to allow larger updates at high noise levels
+                # At sigma_t=100, use base threshold; at sigma_t=1000, allow 10x larger updates
+                sigma_scale = max(1.0, sigma_t / 100.0)
+                effective_limit = denoise_tempering * sigma_scale
+
+                # Compute per-atom displacement norms: [multiplicity, N_atoms]
+                update_norms = update.norm(dim=-1)
+                # Find max displacement across all atoms (per sample): [multiplicity, 1]
+                max_norms = update_norms.max(dim=-1, keepdim=True).values
+                # Scale factor: if max > limit, scale down uniformly
+                scale = torch.where(
+                    max_norms > effective_limit,
+                    effective_limit / max_norms.clamp(min=1e-8),
+                    torch.ones_like(max_norms)
+                )
+                # Apply uniform scaling (preserves relative magnitudes)
+                update = update * scale.unsqueeze(-1)
+
+            atom_coords_next = atom_coords_noisy + update
             atom_coords = atom_coords_next
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)

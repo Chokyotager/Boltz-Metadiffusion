@@ -278,6 +278,7 @@ class Boltz1(LightningModule):
         diffusion_samples: int = 1,
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
+        diffusion_progress_bar: bool = False,
     ) -> dict[str, Tensor]:
         dict_out = {}
 
@@ -373,6 +374,7 @@ class Boltz1(LightningModule):
                     max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
                     steering_args=self.steering_args,
+                    show_progress=diffusion_progress_bar,
                 )
             )
 
@@ -1151,6 +1153,17 @@ class Boltz1(LightningModule):
         self.best_rmsd.reset()
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:
+        # Apply per-record steering config if records have different metadiffusion configs
+        original_steering_args = None
+        per_record = self.steering_args.get("per_record_steering") if self.steering_args else None
+        if per_record:
+            records = batch.get("record", [])
+            if records:
+                record_id = records[0].id
+                if record_id in per_record:
+                    original_steering_args = self.steering_args
+                    self.steering_args = per_record[record_id]
+
         try:
             out = self(
                 batch,
@@ -1159,6 +1172,7 @@ class Boltz1(LightningModule):
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 max_parallel_samples=self.predict_args["diffusion_samples"],
                 run_confidence_sequentially=True,
+                diffusion_progress_bar=self.predict_args.get("diffusion_progress_bar", False),
             )
             pred_dict = {"exception": False}
             pred_dict["masks"] = batch["atom_pad_mask"]
@@ -1203,6 +1217,9 @@ class Boltz1(LightningModule):
                 return {"exception": True}
             else:
                 raise
+        finally:
+            if original_steering_args is not None:
+                self.steering_args = original_steering_args
 
     def configure_optimizers(self):
         """Configure the optimizer."""

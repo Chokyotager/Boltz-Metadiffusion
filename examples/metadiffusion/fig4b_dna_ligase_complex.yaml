@@ -1,0 +1,26 @@
+version: 1
+
+sequences:
+  - protein:
+      id: A
+      sequence: MAITKPLLAATLENIEDVQFPCLATPKIDGIRSVKQTQMLSRTFKPIRNSVMNRLLTELLPEGSDGEISIEGATFQDTTSAVMTGHKMYNAKFSYYWFDYVTDDPLKKYIDRVEDMKNYITVHPHILEHAQVKIIPLIPVEINNITELLQYERDVLSKGFEGVMIRKPDGKYKFGRSTLKEGILLKMKQFKDAEATIISMTALFKNTNTKTKDNFGYSKRSTHKSGKVEEDVMGSIEVDYDGVVFSIGTGFDADQRRDFWQNKESYIGKMVKFKYFEMGSKDCPRFPVFI
+
+  - dna:
+      id: B
+      sequence: TTCCGATAGTGGGGTCGCAAT
+
+  - dna:
+      id: C
+      sequence: ATTGCGACCCCACTATCGGAA
+
+metadiffusion:
+
+  - total_bias_clip: 4.0
+
+  - opt:
+      collective_variable: pair_rmsd_grouped
+      groups: [B, C]
+      rmsd_groups: [A]
+      strength: 4.0
+      warmup: 0.1
+      cutoff: 0.8

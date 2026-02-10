@@ -1240,6 +1240,22 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 seq = standardize(seq)
 
             mol = AllChem.MolFromSmiles(seq)
+            if mol is None:
+                # Try parsing without sanitization, then sanitize with different options
+                mol = AllChem.MolFromSmiles(seq, sanitize=False)
+                if mol is not None:
+                    try:
+                        # Try to sanitize without kekulization first
+                        Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+                        # Then try kekulization
+                        try:
+                            Chem.Kekulize(mol, clearAromaticFlags=False)
+                        except Exception:
+                            pass  # Continue without kekulization
+                    except Exception as e:
+                        raise ValueError(f"Failed to parse SMILES '{seq}': {e}")
+                else:
+                    raise ValueError(f"Failed to parse SMILES '{seq}': RDKit could not parse the structure")
             mol = AllChem.AddHs(mol)
 
             # Set atom names

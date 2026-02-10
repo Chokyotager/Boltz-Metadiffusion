@@ -245,7 +245,192 @@ class BoltzWriter(BasePredictionWriter):
                         / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
                     np.savez_compressed(path, pde=pde.cpu().numpy())
-                
+
+            # Save SAXS P(r) results if present
+            if "saxs_pr_results" in prediction and prediction["saxs_pr_results"]:
+                saxs_dir = struct_dir / "saxs"
+                saxs_dir.mkdir(exist_ok=True)
+
+                saxs_data = prediction["saxs_pr_results"]
+
+                # Save NumPy data
+                npz_path = saxs_dir / f"saxs_pr_fit_{record.id}.npz"
+                np.savez_compressed(
+                    npz_path,
+                    r_grid=saxs_data['r_grid'],
+                    pr_exp=saxs_data['pr_exp'],
+                    pr_calc=saxs_data['pr_calc'],
+                    rg_exp=saxs_data['rg_exp'],
+                    rg_calc=saxs_data['rg_calc'],
+                    w1_loss=saxs_data['w1_loss'],
+                    mse_loss=saxs_data['mse_loss'],
+                )
+
+                # Generate comparison plot
+                try:
+                    import matplotlib
+                    matplotlib.use('Agg')  # Non-interactive backend
+                    import matplotlib.pyplot as plt
+
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+                    # P(r) comparison plot
+                    ax1.plot(saxs_data['r_grid'], saxs_data['pr_exp'], 'b-', linewidth=2, label='Experimental')
+                    ax1.plot(saxs_data['r_grid'], saxs_data['pr_calc'], 'r--', linewidth=2, label='Calculated (ensemble)')
+                    ax1.fill_between(saxs_data['r_grid'], saxs_data['pr_exp'], alpha=0.3, color='blue')
+                    ax1.set_xlabel('r (Å)', fontsize=12)
+                    ax1.set_ylabel('P(r)', fontsize=12)
+                    ax1.set_title(f'SAXS P(r) Fit: {record.id}', fontsize=14)
+                    ax1.legend(fontsize=10)
+                    ax1.grid(True, alpha=0.3)
+
+                    # Add Rg annotation
+                    ax1.text(0.95, 0.95,
+                             f"Rg_exp: {saxs_data['rg_exp']:.1f} Å\nRg_calc: {saxs_data['rg_calc']:.1f} Å",
+                             transform=ax1.transAxes, fontsize=10,
+                             verticalalignment='top', horizontalalignment='right',
+                             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+                    # Residual plot
+                    residual = saxs_data['pr_calc'] - saxs_data['pr_exp']
+                    ax2.plot(saxs_data['r_grid'], residual, 'g-', linewidth=1.5)
+                    ax2.axhline(y=0, color='k', linestyle='--', linewidth=0.5)
+                    ax2.fill_between(saxs_data['r_grid'], residual, alpha=0.3, color='green')
+                    ax2.set_xlabel('r (Å)', fontsize=12)
+                    ax2.set_ylabel('Residual (calc - exp)', fontsize=12)
+                    ax2.set_title('Residual Plot', fontsize=14)
+                    ax2.grid(True, alpha=0.3)
+
+                    # Add loss metrics annotation
+                    ax2.text(0.95, 0.95,
+                             f"W1 Loss: {saxs_data['w1_loss']:.4f}\nMSE Loss: {saxs_data['mse_loss']:.6f}",
+                             transform=ax2.transAxes, fontsize=10,
+                             verticalalignment='top', horizontalalignment='right',
+                             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+                    plt.tight_layout()
+
+                    # Save figure
+                    fig_path = saxs_dir / f"saxs_pr_fit_{record.id}.png"
+                    plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+                    plt.close(fig)
+
+                except ImportError:
+                    pass  # matplotlib not available, skip plot generation
+                except Exception as e:
+                    import warnings
+                    warnings.warn(f"Failed to generate SAXS plot: {e}")
+
+            # Save chemical shift results if present
+            if "cheshift_results" in prediction and prediction["cheshift_results"]:
+                cheshift_dir = struct_dir / "cheshift"
+                cheshift_dir.mkdir(exist_ok=True)
+
+                cheshift_data = prediction["cheshift_results"]
+
+                # Save JSON data
+                json_path = cheshift_dir / f"cheshift_fit_{record.id}.json"
+                with open(json_path, 'w') as f:
+                    json.dump(cheshift_data, f, indent=2)
+
+                # Generate comparison plot
+                try:
+                    import matplotlib
+                    matplotlib.use('Agg')  # Non-interactive backend
+                    import matplotlib.pyplot as plt
+
+                    nuclei = cheshift_data.get('nuclei', {})
+                    n_nuclei = len(nuclei)
+
+                    if n_nuclei > 0:
+                        fig, axes = plt.subplots(2, n_nuclei, figsize=(6 * n_nuclei, 10))
+                        if n_nuclei == 1:
+                            axes = axes.reshape(2, 1)
+
+                        for col, (nucleus, data) in enumerate(nuclei.items()):
+                            residue_nums = data['residue_nums']
+                            exp_shifts = np.array(data['exp_shifts'])
+                            calc_shifts = np.array(data['calc_shifts'])
+                            calc_stds = np.array(data['calc_stds'])
+
+                            # Top plot: Shifts vs residue number
+                            ax1 = axes[0, col]
+                            ax1.errorbar(residue_nums, calc_shifts, yerr=calc_stds,
+                                        fmt='o-', color='red', markersize=4,
+                                        linewidth=1, capsize=2, label='Calculated')
+                            ax1.plot(residue_nums, exp_shifts, 's-', color='blue',
+                                    markersize=4, linewidth=1, label='Experimental')
+                            ax1.set_xlabel('Residue Number', fontsize=12)
+                            ax1.set_ylabel(f'{nucleus} Chemical Shift (ppm)', fontsize=12)
+                            ax1.set_title(f'{nucleus} Chemical Shifts: {record.id}', fontsize=14)
+                            ax1.legend(fontsize=10)
+                            ax1.grid(True, alpha=0.3)
+
+                            # Add metrics annotation
+                            ax1.text(0.95, 0.05,
+                                    f"RMSD: {data['rmsd']:.2f} ppm\n"
+                                    f"MAE: {data['mae']:.2f} ppm\n"
+                                    f"R: {data['correlation']:.3f}",
+                                    transform=ax1.transAxes, fontsize=10,
+                                    verticalalignment='bottom', horizontalalignment='right',
+                                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+                            # Bottom plot: Correlation plot
+                            ax2 = axes[1, col]
+                            ax2.errorbar(exp_shifts, calc_shifts, yerr=calc_stds,
+                                        fmt='o', color='green', markersize=6,
+                                        capsize=2, alpha=0.7)
+
+                            # Add identity line
+                            min_val = min(exp_shifts.min(), calc_shifts.min()) - 1
+                            max_val = max(exp_shifts.max(), calc_shifts.max()) + 1
+                            ax2.plot([min_val, max_val], [min_val, max_val],
+                                    'k--', linewidth=1, label='y=x')
+
+                            ax2.set_xlabel(f'Experimental {nucleus} (ppm)', fontsize=12)
+                            ax2.set_ylabel(f'Calculated {nucleus} (ppm)', fontsize=12)
+                            ax2.set_title(f'{nucleus} Correlation Plot', fontsize=14)
+                            ax2.set_xlim(min_val, max_val)
+                            ax2.set_ylim(min_val, max_val)
+                            ax2.set_aspect('equal')
+                            ax2.grid(True, alpha=0.3)
+                            ax2.legend(fontsize=10)
+
+                        plt.tight_layout()
+
+                        # Save figure
+                        fig_path = cheshift_dir / f"cheshift_fit_{record.id}.png"
+                        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+                        plt.close(fig)
+
+                except ImportError:
+                    pass  # matplotlib not available, skip plot generation
+                except Exception as e:
+                    import warnings
+                    warnings.warn(f"Failed to generate chemical shift plot: {e}")
+
+            # Save bias histories (hills, repulsion energies) and CV histories if present
+            # All data is consolidated into a single JSON file
+            has_biases = "bias_histories" in prediction and prediction["bias_histories"]
+            has_cv_histories = "cv_histories" in prediction and prediction["cv_histories"]
+            if has_biases or has_cv_histories:
+                bias_json_path = struct_dir / f"bias_histories_{record.id}.json"
+                bias_output = {
+                    'record_id': record.id,
+                }
+                # Add sample-to-rank mapping so users can match cv_histories indices to model numbers
+                # cv_histories stores values by internal sample index (0, 1, 2, ...)
+                # Output files are named by rank (model_0 = highest confidence)
+                # sample_to_model_rank[i] = rank means sample i became model_{rank}
+                bias_output['sample_to_model_rank'] = idx_to_rank
+                if has_biases:
+                    bias_output['num_biases'] = len(prediction["bias_histories"])
+                    bias_output['biases'] = prediction["bias_histories"]
+                if has_cv_histories:
+                    bias_output['cv_histories'] = prediction["cv_histories"]
+                with open(bias_json_path, 'w') as f:
+                    json.dump(bias_output, f, indent=2)
+
             # Save embeddings
             if self.write_embeddings and "s" in prediction and "z" in prediction:
                 s = prediction["s"].cpu().numpy()

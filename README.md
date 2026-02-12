@@ -61,6 +61,16 @@ The code is released under the MIT license as per the original Boltz family of m
 If you use this code or the models in your research, please cite the following papers:
 
 ```bibtex
+@article{lam2026metadiffusion,
+  author = {Lam, Hilbert and Pujalte Ojeda, Sebastian and Brezinova, Michaela and Hanke, Josef and Ong, Xing Er and Mu, Yuguang and Vendruscolo, Michele},
+  title = {Metadiffusion: inference-time meta-energy biasing of biomolecular diffusion models},
+  year = {2026},
+  doi = {10.64898/2026.02.10.704873},
+  journal = {bioRxiv}
+}
+```
+
+```bibtex
 @article{passaro2025boltz2,
   author = {Passaro, Saro and Corso, Gabriele and Wohlwend, Jeremy and Reveiz, Mateo and Thaler, Stephan and Somnath, Vignesh Ram and Getz, Noah and Portnoi, Tally and Roy, Julien and Stark, Hannes and Kwabi-Addo, David and Beaini, Dominique and Jaakkola, Tommi and Barzilay, Regina},
   title = {Boltz-2: Towards Accurate and Efficient Binding Affinity Prediction},

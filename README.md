@@ -16,6 +16,8 @@ Metadiffusion is implemented on top of [Boltz-2](https://github.com/jwohlwend/bo
 
 By maximising the pairwise RMSD between samples, highly diverse conformers can be generated. These conformers can also be fitted to experimental data including NMR chemical shifts and SAXS.
 
+You can read the preprint here: https://www.biorxiv.org/content/10.64898/2026.02.10.704873v1
+
 ## Installation
 
 Install Boltz-Metadiffusion directly from GitHub:

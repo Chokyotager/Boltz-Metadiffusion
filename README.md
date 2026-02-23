@@ -24,7 +24,7 @@ Install Boltz-Metadiffusion directly from GitHub:
 
 ```
 git clone https://github.com/Chokyoterger/Boltz-Metadiffusion.git
-cd boltz; pip install -e .[cuda]
+cd Boltz-Metadiffusion; pip install -e .[cuda]
 ```
 
 A fresh environment is recommended for installation.
